@@ -1,0 +1,7 @@
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+openai>=1.12.0
+pydantic>=2.0.0
+pydub>=0.25.1
+audioop-lts>=0.2.0  # required by pydub on Python 3.13+ (audioop removed from stdlib)

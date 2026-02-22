@@ -18,6 +18,18 @@ MAX_TRANSCRIBE_BYTES = int(os.environ.get("MAX_TRANSCRIBE_BYTES", str(25 * 1024 
 # Max file upload size in bytes (server-wide cap for user uploads; e.g. 100MB)
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 
+# Upload TTL: unconsumed uploads expire after this many seconds (default 1 hour)
+UPLOAD_TTL_SECONDS = int(os.environ.get("UPLOAD_TTL_SECONDS", "3600"))
+
+# Max number of entries in upload store (metadata only; ~10 users × 100 chunks). Reject new uploads/chunks when full.
+STORE_MAX_ENTRIES = int(os.environ.get("STORE_MAX_ENTRIES", "1000"))
+
+# How often to run cleanup of expired uploads, in seconds (default 15 minutes)
+CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "900"))
+
+# Orphan audio_split_* dirs older than this (seconds) are deleted by periodic cleanup (default 1 hour)
+AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS = int(os.environ.get("AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS", "3600"))
+
 # CORS: comma-separated origins; default for local dev
 ALLOWED_ORIGINS: List[str] = _str_list(
     os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000")

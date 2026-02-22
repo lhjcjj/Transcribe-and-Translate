@@ -1,0 +1,15 @@
+业务流程/状态,browse,upload,split,transcribe,download,Upload audio files input(有无文件名/有无删除按钮/是否禁用),MB:%实际展示文案,Split input(是否维持用户上次输入),chunks实际展示文案,Choose languages(是否维持上次选项),Clean up transcripts(是否维持上次选项),Tasks information展示内容,transcribe文本是否展示
+初始（未选文件）,启用,禁用,禁用,禁用,禁用,无文件名/无删除按钮/未禁用,MB:%,是（如5）,chunks,是,是,Tasks information,否
+已选文件≤100MB未上传,启用,启用,禁用,禁用,禁用,有文件名/有删除按钮/未禁用,数字+MB:%（如10 MB:%）,是（如5）,chunks,是,是,Tasks information,否
+已选文件>100MB,启用,禁用,禁用,禁用,禁用,有文件名/有删除按钮/未禁用,>100+MB:%,是（如5）,chunks,是,是,Tasks information,否
+正在上传,禁用,启用(cancel),禁用,禁用,禁用,有文件名/无删除按钮/禁用,数字+MB: 进度%,是（如5）,chunks,是,是,Tasks information,否
+已上传等待时长中,禁用,禁用,禁用,禁用,禁用,有文件名/无删除按钮/禁用,数字+MB: 100%,是（如5）,… chunks,是,是,Tasks information,否
+已上传有时长未split(≤25MB),启用,禁用,启用,启用,禁用,有文件名/有删除按钮/未禁用,数字+MB: 100%,是（如5）,0/段数 chunks,是,是,Tasks information,否
+已上传有时长未split(>25MB),启用,禁用,启用,禁用,禁用,有文件名/有删除按钮/未禁用,数字+MB: 100%,是（如5）,0/段数 chunks,是,是,Tasks information,否
+正在 split,禁用,禁用,启用(cancel),视文件≤25MB则启用否则禁用,禁用,有文件名/无删除按钮/禁用,数字+MB: 100%,是（如5）,当前/总数 chunks,是,是,Tasks information,否
+正在删除upload(确认后),禁用,禁用(del…),禁用,禁用,禁用,有文件名/无删除按钮/禁用,数字+MB: 100%,是（如5）,0/N chunks 或 … chunks,是,是,Tasks information,否
+正在取消split(确认后),禁用,禁用,禁用(del…),禁用,禁用,有文件名/无删除按钮/禁用,数字+MB:%,是（如5）,chunks,是,是,Tasks information,否
+Split完成(有chunks),启用,禁用,禁用,启用,禁用,有文件名/有删除按钮/未禁用,数字+MB:%,是（如5）,N/N chunks,是,是,Tasks information,否
+正在转写,禁用,禁用,禁用,禁用,禁用,有文件名/无删除按钮/禁用,chunks路径为数字+MB:%；单文件路径为数字+MB: 100%,是（如5）,N/N chunks 或 0/N chunks,是,是,有chunk进度时为当前文件名否则 Transcribing…,否
+有转写结果无失败,启用,启用,禁用,禁用,启用,有文件名/有删除按钮/未禁用,数字+MB:%,是（如5）,chunks,是,是,Tasks information,是
+有失败chunks需重试,启用,启用,禁用,启用(retry failed),启用,有文件名/有删除按钮/未禁用,数字+MB:%,是（如5）,chunks,是,是,Tasks information,是（局部结果）

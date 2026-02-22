@@ -8,3 +8,11 @@ class TranscribeResponse(BaseModel):
     failed_chunk_ids: list[str] | None = Field(
         None, description="Upload IDs of chunks that failed (use these to retry transcription)"
     )
+    text_segments: list[str] | None = Field(
+        None,
+        description="Segment texts in request order (one per chunk; empty string for failed). Only when upload_ids were used.",
+    )
+    failed_chunk_indices: list[int] | None = Field(
+        None,
+        description="0-based indices of failed chunks in the original request order. Only when failed_chunk_ids is present.",
+    )

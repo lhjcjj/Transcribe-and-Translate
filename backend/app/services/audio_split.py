@@ -1,9 +1,11 @@
 """Split audio into chunks by fixed duration (5 min per segment, or 1 min for WAV)."""
 import io
+import math
 import shutil
 import tempfile
 import threading
 from pathlib import Path
+from typing import Callable
 
 from pydub import AudioSegment
 
@@ -28,10 +30,26 @@ def _format_from_filename(filename: str) -> str:
     return "mp3"
 
 
-def split_audio_into_chunks(audio_bytes: bytes, filename: str) -> tuple[str, list[tuple[str, str]]]:
+def get_audio_duration_seconds(file_path: str, filename: str) -> float:
+    """Return duration of the audio file in seconds. Raises ValueError if unreadable."""
+    fmt = _format_from_filename(filename)
+    try:
+        segment = AudioSegment.from_file(file_path, format=fmt)
+    except Exception as e:
+        raise ValueError(f"Failed to load audio: {e}") from e
+    return len(segment) / 1000.0
+
+
+def split_audio_into_chunks(
+    audio_bytes: bytes,
+    filename: str,
+    segment_minutes: int = 5,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[str, list[tuple[str, str]]]:
     """
-    Split audio by fixed duration: Non-WAV 5 minutes per segment, WAV 1 minute per segment.
+    Split audio by fixed duration (segment_minutes per chunk).
     Writes each chunk to disk immediately so memory holds at most: decoded segment + one chunk.
+    If progress_callback is given, calls progress_callback(current_1based, total) after each chunk.
 
     Uses time boundaries (via pydub) so each chunk is valid audio. Requires ffmpeg for m4a/mp3 etc.
 
@@ -45,12 +63,17 @@ def split_audio_into_chunks(audio_bytes: bytes, filename: str) -> tuple[str, lis
     """
     _split_lock.acquire()
     try:
-        return _split_audio_into_chunks_impl(audio_bytes, filename)
+        return _split_audio_into_chunks_impl(audio_bytes, filename, segment_minutes, progress_callback)
     finally:
         _split_lock.release()
 
 
-def _split_audio_into_chunks_impl(audio_bytes: bytes, filename: str) -> tuple[str, list[tuple[str, str]]]:
+def _split_audio_into_chunks_impl(
+    audio_bytes: bytes,
+    filename: str,
+    segment_minutes: int = 5,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[str, list[tuple[str, str]]]:
     """Implementation of split_audio_into_chunks (called while holding _split_lock)."""
     if not audio_bytes:
         raise ValueError("Empty audio bytes")
@@ -68,17 +91,20 @@ def _split_audio_into_chunks_impl(audio_bytes: bytes, filename: str) -> tuple[st
     if duration_ms <= 0:
         raise ValueError("Audio has no duration")
 
-    # WAV is uncompressed and large: 1 minute per chunk. Other formats: 5 minutes per chunk.
-    if fmt == "wav":
-        nominal_segment_duration_ms = 60 * 1000  # 1 minute
-    else:
-        nominal_segment_duration_ms = 5 * 60 * 1000  # 5 minutes
+    nominal_segment_duration_ms = segment_minutes * 60 * 1000
+    total_chunks = max(1, math.ceil(duration_ms / nominal_segment_duration_ms))
+    if progress_callback:
+        progress_callback(0, total_chunks)
 
     temp_dir = tempfile.mkdtemp(prefix="audio_split_")
     try:
-        out_list = _write_chunks(segment, fmt, base_name, temp_dir)
+        out_list = _write_chunks(
+            segment, fmt, base_name, temp_dir, nominal_segment_duration_ms,
+            progress_callback=progress_callback, total_chunks=total_chunks,
+        )
         return (temp_dir, out_list)
     except Exception:
+        # On cancel or any error: remove temp_dir and all chunks already written.
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except OSError:
@@ -86,12 +112,19 @@ def _split_audio_into_chunks_impl(audio_bytes: bytes, filename: str) -> tuple[st
         raise
 
 
-def _write_chunks(segment, fmt: str, base_name: str, temp_dir: str) -> list[tuple[str, str]]:
+def _write_chunks(
+    segment,
+    fmt: str,
+    base_name: str,
+    temp_dir: str,
+    nominal_segment_duration_ms: int,
+    progress_callback: Callable[[int, int], None] | None = None,
+    total_chunks: int = 0,
+) -> list[tuple[str, str]]:
     out_list: list[tuple[str, str]] = []
     start_ms = 0
     index = 0
     duration_ms = len(segment)
-    nominal_segment_duration_ms = 60 * 1000 if fmt == "wav" else 5 * 60 * 1000
 
     while start_ms < duration_ms:
         curr_duration_ms = min(nominal_segment_duration_ms, duration_ms - start_ms)
@@ -107,6 +140,8 @@ def _write_chunks(segment, fmt: str, base_name: str, temp_dir: str) -> list[tupl
         chunk_path = Path(temp_dir) / chunk_filename
         chunk_path.write_bytes(chunk_bytes)  # (2) write immediately, then release refs
         out_list.append((str(chunk_path), chunk_filename))
+        if progress_callback and total_chunks:
+            progress_callback(index + 1, total_chunks)
         del part, buf, chunk_bytes  # release before next iteration to ease GC
         index += 1
         start_ms = end_ms

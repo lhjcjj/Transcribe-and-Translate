@@ -46,7 +46,7 @@ async def _cleanup_loop(stop: asyncio.Event) -> None:
 app = FastAPI(
     title="Transcribe and Translate",
     description="Audio transcription and text translation API",
-    version="0.1.0",
+    version="1.0.2",
     lifespan=lifespan,
 )
 
@@ -54,8 +54,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "X-API-Key", "Authorization"],
 )
 
 app.include_router(router)

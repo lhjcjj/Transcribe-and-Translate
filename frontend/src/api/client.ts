@@ -1,13 +1,47 @@
 /**
  * Backend API client. Uses relative /api in dev (Vite proxy) or VITE_API_BASE in build.
- * No API keys or secrets here; all auth is on the backend.
+ * When VITE_API_KEY is set (same as backend API_KEY), all requests send X-API-Key header.
  */
 const API_BASE = (typeof import.meta !== "undefined" && (import.meta as ImportMeta).env?.VITE_API_BASE) || "";
 
+function getApiHeaders(): Record<string, string> {
+  const key = (typeof import.meta !== "undefined" && (import.meta as ImportMeta).env?.VITE_API_KEY) as string | undefined;
+  if (!key) return {};
+  return { "X-API-Key": key };
+}
+
+export interface UploadConfig {
+  max_upload_bytes: number;
+}
+
+export async function getUploadConfig(
+  options?: { signal?: AbortSignal }
+): Promise<UploadConfig> {
+  const res = await fetch(`${API_BASE}/api/config`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Get config failed"));
+  }
+  return res.json();
+}
+
+/** Return safe user-facing message; reject raw strings that look like paths or stack traces. */
+function sanitizeErrorMessage(raw: string, fallback: string): string {
+  const looksInternal =
+    raw.includes("\n") ||
+    /Traceback|File\s+["']|^\s*\/[^\s]/.test(raw) ||
+    /[a-zA-Z]:\\.*\.(py|js|ts)/.test(raw);
+  return looksInternal ? fallback : raw;
+}
+
+/** Use backend detail only; avoid exposing internal paths/stack. Reject detail that looks like paths or stack traces. */
 async function getErrorMessageFromResponse(res: Response, defaultMessage: string): Promise<string> {
   try {
     const body = (await res.json()) as { detail?: string };
-    return body.detail ?? res.statusText ?? defaultMessage;
+    const raw = body.detail ?? res.statusText ?? defaultMessage;
+    return sanitizeErrorMessage(raw, res.statusText || defaultMessage);
   } catch {
     return res.statusText || defaultMessage;
   }
@@ -30,14 +64,9 @@ export function upload(
     const xhr = new XMLHttpRequest();
     const onAbort = () => {
       xhr.abort();
-      signal?.removeEventListener("abort", onAbort);
+      removeListeners();
     };
-    if (signal) signal.addEventListener("abort", onAbort);
-    const done = (fn: () => void) => () => {
-      signal?.removeEventListener("abort", onAbort);
-      fn();
-    };
-    xhr.upload.addEventListener("progress", (e) => {
+    const onProgressHandler = (e: ProgressEvent<XMLHttpRequestEventTarget>) => {
       if (e.lengthComputable && onProgress) {
         onProgress({
           loaded: e.loaded,
@@ -45,14 +74,16 @@ export function upload(
           percent: Math.min(99, Math.round((e.loaded / e.total) * 100)),
         });
       }
-    });
-    xhr.addEventListener("load", () => {
+    };
+    const onLoadHandler = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const data = JSON.parse(xhr.responseText) as { upload_id: string; duration_seconds?: number | null };
-          done(() => resolve(data))();
+          removeListeners();
+          resolve(data);
         } catch {
-          done(() => reject(new Error("Invalid response")))();
+          removeListeners();
+          reject(new Error("Invalid response"));
         }
       } else {
         let detail = xhr.statusText;
@@ -62,19 +93,45 @@ export function upload(
         } catch {
           // ignore
         }
-        done(() => reject(new Error(detail || "Upload failed")))();
+        removeListeners();
+        detail = sanitizeErrorMessage(detail || "Upload failed", "Upload failed");
+        reject(new Error(detail));
       }
-    });
-    xhr.addEventListener("error", done(() => reject(new Error("Network error"))));
-    xhr.addEventListener("abort", done(() => reject(new DOMException("Aborted", "AbortError"))));
+    };
+    const onErrorHandler = () => {
+      removeListeners();
+      reject(new Error("Network error"));
+    };
+    const onAbortXhr = () => {
+      removeListeners();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const removeListeners = () => {
+      signal?.removeEventListener("abort", onAbort);
+      xhr.upload.removeEventListener("progress", onProgressHandler);
+      xhr.removeEventListener("load", onLoadHandler);
+      xhr.removeEventListener("error", onErrorHandler);
+      xhr.removeEventListener("abort", onAbortXhr);
+    };
+    if (signal) signal.addEventListener("abort", onAbort);
+    xhr.upload.addEventListener("progress", onProgressHandler);
+    xhr.addEventListener("load", onLoadHandler);
+    xhr.addEventListener("error", onErrorHandler);
+    xhr.addEventListener("abort", onAbortXhr);
     xhr.open("POST", `${API_BASE}/api/upload`);
+    Object.entries(getApiHeaders()).forEach(([k, v]) => xhr.setRequestHeader(k, v));
     xhr.send(form);
   });
 }
 
-export async function deleteUpload(uploadId: string): Promise<void> {
+export async function deleteUpload(
+  uploadId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
   const res = await fetch(`${API_BASE}/api/upload/${encodeURIComponent(uploadId)}`, {
     method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
   });
   if (!res.ok && res.status !== 404) {
     throw new Error(await getErrorMessageFromResponse(res, "Delete upload failed"));
@@ -87,8 +144,14 @@ export interface SplitChunkItem {
   upload_id: string;
 }
 
-export async function getUploadDuration(uploadId: string): Promise<{ duration_seconds: number }> {
-  const res = await fetch(`${API_BASE}/api/upload/${encodeURIComponent(uploadId)}/duration`);
+export async function getUploadDuration(
+  uploadId: string,
+  options?: { signal?: AbortSignal }
+): Promise<{ duration_seconds: number }> {
+  const res = await fetch(`${API_BASE}/api/upload/${encodeURIComponent(uploadId)}/duration`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
   if (!res.ok) {
     throw new Error(await getErrorMessageFromResponse(res, "Get duration failed"));
   }
@@ -103,7 +166,7 @@ export async function splitStream(
 ): Promise<{ temp_dir: string; chunks: SplitChunkItem[] }> {
   const res = await fetch(`${API_BASE}/api/split/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({ upload_id: uploadId, segment_minutes: segmentMinutes }),
     signal,
   });
@@ -132,7 +195,7 @@ export async function splitStream(
     } else if (item.type === "result" && item.temp_dir != null && item.chunks) {
       state.result = { temp_dir: item.temp_dir, chunks: item.chunks };
     } else if (item.type === "error") {
-      state.errorDetail = item.detail ?? defaultError;
+      state.errorDetail = sanitizeErrorMessage(item.detail ?? defaultError, defaultError);
     }
   }
 
@@ -153,7 +216,7 @@ export async function splitStream(
       if (item.type === "result" && item.temp_dir != null && item.chunks) {
         state.result = { temp_dir: item.temp_dir, chunks: item.chunks };
       } else if (item.type === "error" && state.errorDetail == null) {
-        state.errorDetail = item.detail ?? defaultError;
+        state.errorDetail = sanitizeErrorMessage(item.detail ?? defaultError, defaultError);
       }
     } catch {
       /* ignore malformed trailing buffer */
@@ -165,22 +228,34 @@ export async function splitStream(
 }
 
 /** Ask the server to stop the currently running split/stream. Call when user cancels split. */
-export async function cancelSplitStream(): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/split/cancel`, { method: "POST" });
+export async function cancelSplitStream(
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/split/cancel`, {
+    method: "POST",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
   if (!res.ok && res.status !== 204) {
     throw new Error(res.statusText || "Cancel split failed");
   }
 }
 
-async function jsonPost(path: string, body: object): Promise<Response> {
+async function jsonPost(
+  path: string,
+  body: object,
+  options?: { signal?: AbortSignal }
+): Promise<Response> {
   return fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: options?.signal,
   });
 }
 
-export interface TranscribeResult {
+/** API response shape for transcribe endpoints (avoids name clash with TranscribeResult component). */
+export interface TranscribeApiResult {
   text: string;
   failed_chunk_ids?: string[] | null;
   text_segments?: string[] | null;
@@ -189,8 +264,8 @@ export interface TranscribeResult {
 
 export async function transcribe(
   file: File,
-  options?: { language?: string; cleanUp?: boolean }
-): Promise<TranscribeResult> {
+  options?: { language?: string; cleanUp?: boolean; signal?: AbortSignal }
+): Promise<TranscribeApiResult> {
   const form = new FormData();
   form.append("audio", file);
   if (options?.language != null && options.language !== "") {
@@ -199,24 +274,9 @@ export async function transcribe(
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
   const res = await fetch(`${API_BASE}/api/transcribe`, {
     method: "POST",
+    headers: getApiHeaders(),
     body: form,
-  });
-  if (!res.ok) {
-    throw new Error(await getErrorMessageFromResponse(res, "Transcription failed"));
-  }
-  return res.json();
-}
-
-export async function transcribeByUploadIds(
-  uploadIds: string[],
-  options?: { cleanupFailed?: boolean }
-): Promise<TranscribeResult> {
-  const form = new FormData();
-  uploadIds.forEach((id) => form.append("upload_ids", id));
-  form.append("cleanup_failed", options?.cleanupFailed === true ? "true" : "false");
-  const res = await fetch(`${API_BASE}/api/transcribe`, {
-    method: "POST",
-    body: form,
+    signal: options?.signal,
   });
   if (!res.ok) {
     throw new Error(await getErrorMessageFromResponse(res, "Transcription failed"));
@@ -229,8 +289,8 @@ export type TranscribeChunkProgress = { current: number; total: number; filename
 export async function transcribeByUploadIdsStream(
   uploadIds: string[],
   onProgress: (current: number, total: number, filename: string) => void,
-  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean }
-): Promise<TranscribeResult> {
+  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean; signal?: AbortSignal }
+): Promise<TranscribeApiResult> {
   const form = new FormData();
   uploadIds.forEach((id) => form.append("upload_ids", id));
   form.append("cleanup_failed", options?.cleanupFailed === true ? "true" : "false");
@@ -240,7 +300,9 @@ export async function transcribeByUploadIdsStream(
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
   const res = await fetch(`${API_BASE}/api/transcribe/stream`, {
     method: "POST",
+    headers: getApiHeaders(),
     body: form,
+    signal: options?.signal,
   });
   if (!res.ok) {
     throw new Error(await getErrorMessageFromResponse(res, "Transcription failed"));
@@ -249,7 +311,7 @@ export async function transcribeByUploadIdsStream(
   if (!reader) throw new Error("No response body");
   const decoder = new TextDecoder();
   let buffer = "";
-  let result: TranscribeResult | null = null;
+  let result: TranscribeApiResult | null = null;
   while (true) {
     const { value, done } = await reader.read();
     if (value) buffer += decoder.decode(value, { stream: true });
@@ -279,7 +341,7 @@ export async function transcribeByUploadIdsStream(
             failed_chunk_indices: item.failed_chunk_indices ?? null,
           };
         } else if (item.type === "error") {
-          throw new Error(item.detail ?? "Transcription failed");
+          throw new Error(sanitizeErrorMessage(item.detail ?? "Transcription failed", "Transcription failed"));
         }
       } catch (e) {
         if (e instanceof SyntaxError) continue;
@@ -294,7 +356,7 @@ export async function transcribeByUploadIdsStream(
       if (item.type === "result") {
         result = { text: item.text ?? "", failed_chunk_ids: item.failed_chunk_ids ?? null, text_segments: item.text_segments ?? null, failed_chunk_indices: item.failed_chunk_indices ?? null };
       } else if (item.type === "error") {
-        throw new Error(item.detail ?? "Transcription failed");
+        throw new Error(sanitizeErrorMessage(item.detail ?? "Transcription failed", "Transcription failed"));
       }
     } catch (e) {
       if (!(e instanceof SyntaxError)) throw e;
@@ -304,8 +366,16 @@ export async function transcribeByUploadIdsStream(
   return result;
 }
 
-export async function translate(text: string, targetLang: string): Promise<{ text: string }> {
-  const res = await jsonPost("/api/translate", { text, target_lang: targetLang });
+export async function translate(
+  text: string,
+  targetLang: string,
+  options?: { signal?: AbortSignal }
+): Promise<{ text: string }> {
+  const res = await jsonPost(
+    "/api/translate",
+    { text, target_lang: targetLang },
+    options
+  );
   if (!res.ok) {
     throw new Error(await getErrorMessageFromResponse(res, "Translation failed"));
   }

@@ -1,5 +1,6 @@
 """Split audio into chunks by fixed duration (5 min per segment, or 1 min for WAV)."""
 import io
+import logging
 import math
 import shutil
 import tempfile
@@ -9,9 +10,12 @@ from typing import Callable
 
 from pydub import AudioSegment
 
+logger = logging.getLogger(__name__)
 
-# Only one split at a time to limit peak memory (one decoded file + one chunk).
-_split_lock = threading.Lock()
+from app import config
+
+# Limit concurrent splits to control peak memory (SPLIT_MAX_CONCURRENT from config; 1 = serial).
+_split_semaphore = threading.Semaphore(config.SPLIT_MAX_CONCURRENT)
 
 # Format suffixes Whisper supports; pydub uses same names for import/export
 SUPPORTED_SUFFIXES = (".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm")
@@ -36,7 +40,8 @@ def get_audio_duration_seconds(file_path: str, filename: str) -> float:
     try:
         segment = AudioSegment.from_file(file_path, format=fmt)
     except Exception as e:
-        raise ValueError(f"Failed to load audio: {e}") from e
+        logger.error("Failed to load audio")
+        raise ValueError("Failed to load audio.") from e
     return len(segment) / 1000.0
 
 
@@ -59,13 +64,13 @@ def split_audio_into_chunks(
     Raises:
         ValueError: Unsupported format, empty audio, or ffmpeg/pydub error.
 
-    Only one split runs at a time (global lock) to avoid OOM from concurrent large files.
+    At most SPLIT_MAX_CONCURRENT splits run at once (configurable) to limit peak memory.
     """
-    _split_lock.acquire()
+    _split_semaphore.acquire()
     try:
         return _split_audio_into_chunks_impl(audio_bytes, filename, segment_minutes, progress_callback)
     finally:
-        _split_lock.release()
+        _split_semaphore.release()
 
 
 def _split_audio_into_chunks_impl(
@@ -74,7 +79,7 @@ def _split_audio_into_chunks_impl(
     segment_minutes: int = 5,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[str, list[tuple[str, str]]]:
-    """Implementation of split_audio_into_chunks (called while holding _split_lock)."""
+    """Implementation of split_audio_into_chunks (called while holding _split_semaphore)."""
     if not audio_bytes:
         raise ValueError("Empty audio bytes")
 
@@ -84,7 +89,8 @@ def _split_audio_into_chunks_impl(
     try:
         segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
     except Exception as e:
-        raise ValueError(f"Failed to load audio (install ffmpeg for {fmt}): {e}") from e
+        logger.error("Failed to load audio")
+        raise ValueError("Failed to load audio. Unsupported format or missing ffmpeg.") from e
     del audio_bytes  # (1) drop original file as soon as decoded; keep only decoded segment
 
     duration_ms = len(segment)
@@ -104,11 +110,12 @@ def _split_audio_into_chunks_impl(
         )
         return (temp_dir, out_list)
     except Exception:
+        logger.debug("Split audio into chunks failed", exc_info=True)
         # On cancel or any error: remove temp_dir and all chunks already written.
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except OSError:
-            pass
+            logger.debug("Cleanup failed (rmtree)")
         raise
 
 

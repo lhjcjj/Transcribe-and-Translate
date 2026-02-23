@@ -8,34 +8,44 @@ import re
 import shutil
 import threading
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-
-class SplitCancelled(Exception):
-    """Raised when client disconnects during split stream."""
-    pass
-
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app import config
-from app.api.deps import allowed_audio_content_type, read_file_with_size_cap
+from app.api.deps import allowed_audio_content_type, read_file_with_size_cap, require_api_key
 from app.schemas.upload import (
     SplitRequest,
     SplitResponse,
     UploadChunkItem,
+    UploadConfigResponse,
     UploadDurationResponse,
     UploadResponse,
 )
-from app.api.upload_store import StoreFullError, get_upload, pop_upload, put_upload, save_upload_bytes
+from app.api.upload_store import (
+    StoreFullError,
+    get_upload,
+    pop_upload,
+    put_upload,
+    save_upload_bytes,
+    upload_semaphore,
+)
 from app.schemas.transcribe import TranscribeResponse
 from app.schemas.translate import TranslateRequest, TranslateResponse
 from app.services import audio_split as audio_split_svc
 from app.services import transcribe as transcribe_svc
 from app.services import translate as translate_svc
 
-router = APIRouter(prefix="/api", tags=["api"])
+
+class SplitCancelled(Exception):
+    """Raised when client disconnects during split stream."""
+    pass
+
+
+router = APIRouter(prefix="/api", tags=["api"], dependencies=[Depends(require_api_key)])
 
 _MULTIPART_OVERHEAD_BYTES = 1 * 1024 * 1024  # 1MB for Content-Length reject
 
@@ -54,6 +64,10 @@ def _transcribe_413_message() -> str:
 # Sanitize target_lang: alphanumeric, spaces, hyphens only (no injection)
 TARGET_LANG_PATTERN = re.compile(r"^[a-zA-Z0-9\u4e00-\u9fff\s\-]{1,20}$")
 
+# Filename: max length and allowed chars (alphanumeric, dot, underscore, hyphen, space, basic Unicode letters)
+FILENAME_MAX_LENGTH = 200
+FILENAME_ALLOWED_PATTERN = re.compile(r"[a-zA-Z0-9._\s\-\u4e00-\u9fff]+")
+
 
 def _reject_413(message: str) -> None:
     """Raise HTTP 413 with the given message (caller never returns)."""
@@ -61,10 +75,17 @@ def _reject_413(message: str) -> None:
 
 
 def _sanitize_filename(audio: UploadFile) -> str:
+    """Return a safe filename: no path, whitelist chars only, max length. Prevents abuse and confusion."""
     name = audio.filename or "audio"
     if "/" in name or "\\" in name:
         name = name.replace("\\", "/").split("/")[-1]
-    return name.strip() or "audio"
+    name = name.strip()
+    # Keep only allowed characters
+    name = ("".join(FILENAME_ALLOWED_PATTERN.findall(name))).strip() or "audio"
+    # Truncate to max length
+    if len(name) > FILENAME_MAX_LENGTH:
+        name = name[:FILENAME_MAX_LENGTH].rstrip() or "audio"
+    return name
 
 
 def _consume_upload_body(upload_id: str) -> tuple[bytes, str]:
@@ -80,7 +101,7 @@ def _consume_upload_body(upload_id: str) -> tuple[bytes, str]:
         try:
             os.unlink(temp_path)
         except OSError:
-            pass
+            logger.debug("Cleanup failed (unlink)")
     if len(body) == 0:
         del body
         raise HTTPException(400, "Empty file")
@@ -88,9 +109,9 @@ def _consume_upload_body(upload_id: str) -> tuple[bytes, str]:
 
 
 def _build_chunk_items(chunk_list: list[tuple[str, str]]) -> list[UploadChunkItem]:
-    """Build list of UploadChunkItem from (path, filename) list and register each in upload_store."""
+    """Build list of UploadChunkItem from (path, filename) list and register each in upload_store. path not sent to client."""
     return [
-        UploadChunkItem(path=p, filename=n, upload_id=put_upload(p, n, os.path.getsize(p)))
+        UploadChunkItem(path="", filename=n, upload_id=put_upload(p, n, os.path.getsize(p)))
         for p, n in chunk_list
     ]
 
@@ -111,6 +132,12 @@ def _record_failed_chunk(
         put_upload(chunk_path, chunk_filename, os.path.getsize(chunk_path))
 
 
+@router.get("/config", response_model=UploadConfigResponse)
+def get_upload_config() -> UploadConfigResponse:
+    """Return upload limits so the frontend can validate without duplicating backend config."""
+    return UploadConfigResponse(max_upload_bytes=config.MAX_UPLOAD_BYTES)
+
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload(req: Request, audio: UploadFile = File(...)) -> UploadResponse:
     """Upload an audio file (step 1). Saves file only; call POST /api/split with upload_id to split. Max size MAX_UPLOAD_BYTES (e.g. 100MB)."""
@@ -126,26 +153,27 @@ async def upload(req: Request, audio: UploadFile = File(...)) -> UploadResponse:
         except ValueError:
             pass
 
-    try:
-        body = await read_file_with_size_cap(
-            audio, config.MAX_UPLOAD_BYTES, lambda: _reject_413(_upload_413_message())
-        )
-        if len(body) == 0:
-            del body
-            raise HTTPException(400, "Empty file")
-
-        name = _sanitize_filename(audio)
+    async with upload_semaphore:
         try:
-            upload_id = save_upload_bytes(body, name)
-        except StoreFullError:
+            body = await read_file_with_size_cap(
+                audio, config.MAX_UPLOAD_BYTES, lambda: _reject_413(_upload_413_message())
+            )
+            if len(body) == 0:
+                del body
+                raise HTTPException(400, "Empty file")
+
+            name = _sanitize_filename(audio)
+            try:
+                upload_id = save_upload_bytes(body, name)
+            except StoreFullError:
+                del body
+                raise HTTPException(503, "Upload store full. Try again later.")
             del body
-            raise HTTPException(503, "Upload store full. Try again later.")
-        del body
-        # Return immediately so client gets upload_id fast; duration via GET /upload/{id}/duration.
-        # This avoids orphan temp files when user cancels before response (no reliance on http.disconnect).
-        return UploadResponse(upload_id=upload_id, duration_seconds=None)
-    finally:
-        await audio.close()
+            # Return immediately so client gets upload_id fast; duration via GET /upload/{id}/duration.
+            # This avoids orphan temp files when user cancels before response (no reliance on http.disconnect).
+            return UploadResponse(upload_id=upload_id, duration_seconds=None)
+        finally:
+            await audio.close()
 
 
 @router.get("/upload/{upload_id}/duration", response_model=UploadDurationResponse)
@@ -158,8 +186,8 @@ async def get_upload_duration(upload_id: str) -> UploadDurationResponse:
     try:
         duration_seconds = audio_split_svc.get_audio_duration_seconds(temp_path, filename)
         return UploadDurationResponse(duration_seconds=duration_seconds)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+    except ValueError:
+        raise HTTPException(400, "Failed to get audio duration or invalid file")
 
 
 @router.delete("/upload/{upload_id}", status_code=204)
@@ -172,14 +200,14 @@ async def delete_upload(upload_id: str) -> None:
     try:
         os.unlink(temp_path)
     except OSError:
-        pass
+        logger.debug("Cleanup failed (unlink)")
     try:
         parent = os.path.dirname(temp_path)
         if os.path.basename(parent).startswith("audio_split_") and os.path.isdir(parent):
             if not os.listdir(parent):
                 os.rmdir(parent)
     except OSError:
-        pass
+        logger.debug("Cleanup failed (rmdir)")
 
 
 @router.post("/split", response_model=SplitResponse)
@@ -190,15 +218,15 @@ async def split(req: SplitRequest) -> SplitResponse:
         temp_dir, chunk_list = audio_split_svc.split_audio_into_chunks(
             body, filename, segment_minutes=req.segment_minutes
         )
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+    except ValueError:
+        raise HTTPException(400, "Split failed: invalid audio or unsupported format")
     finally:
         del body
     try:
         chunks_with_ids = _build_chunk_items(chunk_list)
     except StoreFullError:
         raise HTTPException(503, "Upload store full. Try again later.")
-    return SplitResponse(temp_dir=temp_dir, chunks=chunks_with_ids)
+    return SplitResponse(temp_dir="", chunks=chunks_with_ids)
 
 
 def _split_with_progress(
@@ -221,14 +249,16 @@ def _split_with_progress(
         chunks_with_ids = _build_chunk_items(chunk_list)
         progress_queue.put({
             "type": "result",
-            "temp_dir": temp_dir,
+            "temp_dir": "",
             "chunks": [c.model_dump() for c in chunks_with_ids],
         })
     except SplitCancelled:
         # temp_dir and any partial chunks are already removed by split_audio_into_chunks (rmtree on exception).
         progress_queue.put({"type": "cancelled"})
-    except Exception as e:
-        progress_queue.put({"type": "error", "detail": str(e)})
+    except Exception:
+        logger.error("Split stream failed")
+        logger.debug("Split stream exception", exc_info=True)
+        progress_queue.put({"type": "error", "detail": "Split failed"})
 
 
 async def _wait_disconnect(request: Request) -> None:
@@ -271,10 +301,11 @@ async def split_stream(req: SplitRequest, request: Request):
         _current_split_cancel_event = cancel_event
 
     async def ndjson_stream():
+        executor_fut: asyncio.Future | None = None
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             body_ref = body  # avoid UnboundLocalError (del body below makes body local otherwise)
-            executor = loop.run_in_executor(
+            executor_fut = loop.run_in_executor(
                 None,
                 _split_with_progress,
                 body_ref,
@@ -295,14 +326,12 @@ async def split_stream(req: SplitRequest, request: Request):
                 if disconnect_task in done:
                     (get_task,) = pending
                     item = await get_task
-                    print("[split/stream] put message:", item)
                     yield json.dumps(item, ensure_ascii=False) + "\n"
                     if received_real_progress:
                         cancel_event.set()
                     break
                 if get_task in done:
                     item = get_task.result()
-                    print("[split/stream] put message:", item)
                     if item.get("type") == "progress" and item.get("current", 0) >= 1:
                         received_real_progress = True
                     disconnect_task.cancel()
@@ -315,9 +344,22 @@ async def split_stream(req: SplitRequest, request: Request):
                     if item.get("type") == "progress" and item.get("current", 0) >= 1:
                         await asyncio.sleep(PROGRESS_YIELD_DELAY_SEC)
                     if item.get("type") in ("result", "error", "cancelled"):
+                        disconnect_task.cancel()
+                        try:
+                            await disconnect_task
+                        except asyncio.CancelledError:
+                            pass
                         break
         finally:
             _clear_current_split_cancel_event()
+            if executor_fut is not None:
+                try:
+                    await executor_fut
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.error("Split stream executor failed")
+                    logger.debug("Split stream executor exception", exc_info=True)
 
     return StreamingResponse(
         ndjson_stream(),
@@ -342,6 +384,111 @@ def _parse_clean_up(raw: str | None) -> bool:
     return raw.strip().lower() in ("true", "yes", "1")
 
 
+def _transcribe_upload_ids_impl(
+    ids: list[str],
+    cleanup_failed: bool,
+    language: str,
+    clean_up: bool,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[list[str], list[str], list[int], set[Path], list[tuple[str, str]]]:
+    """Shared transcribe loop for upload_ids. Optionally call progress_callback(current_1based, total, filename) before each chunk. Returns (segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup). May raise StoreFullError."""
+    segments: list[str] = [""] * len(ids)
+    failed_chunk_ids: list[str] = []
+    failed_chunk_indices: list[int] = []
+    parent_dirs: set[Path] = set()
+    failed_chunks_to_cleanup: list[tuple[str, str]] = []
+    for i, uid in enumerate(ids):
+        entry = pop_upload(uid)
+        if not entry:
+            failed_chunk_ids.append(uid)
+            failed_chunk_indices.append(i)
+            continue
+        chunk_path, chunk_filename = entry
+        parent_dirs.add(Path(chunk_path).parent)
+        if progress_callback is not None:
+            progress_callback(i + 1, len(ids), chunk_filename)
+        try:
+            chunk_bytes = Path(chunk_path).read_bytes()
+        except Exception:
+            logger.error("Failed to read chunk file")
+            logger.debug("Read chunk file exception", exc_info=True)
+            _record_failed_chunk(
+                chunk_path, chunk_filename, cleanup_failed,
+                failed_chunk_ids, uid, failed_chunks_to_cleanup,
+            )
+            failed_chunk_indices.append(i)
+            continue
+        if len(chunk_bytes) == 0:
+            _record_failed_chunk(
+                chunk_path, chunk_filename, cleanup_failed,
+                failed_chunk_ids, uid, failed_chunks_to_cleanup,
+            )
+            failed_chunk_indices.append(i)
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                logger.debug("Cleanup failed (unlink)")
+            continue
+        try:
+            segment_text = transcribe_svc.transcribe_audio(
+                chunk_bytes, chunk_filename, language=language, clean_up=clean_up
+            )
+            segments[i] = segment_text
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                logger.debug("Cleanup failed (unlink)")
+        except ValueError:
+            logger.error("Transcription failed (upload_ids)")
+            logger.debug("Transcription upload_ids ValueError", exc_info=True)
+            _record_failed_chunk(
+                chunk_path, chunk_filename, cleanup_failed,
+                failed_chunk_ids, uid, failed_chunks_to_cleanup,
+            )
+            failed_chunk_indices.append(i)
+        except Exception:
+            logger.error("Transcription failed (upload_ids)")
+            logger.debug("Transcription upload_ids exception", exc_info=True)
+            _record_failed_chunk(
+                chunk_path, chunk_filename, cleanup_failed,
+                failed_chunk_ids, uid, failed_chunks_to_cleanup,
+            )
+            failed_chunk_indices.append(i)
+        finally:
+            del chunk_bytes
+    return (segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup)
+
+
+def _cleanup_after_transcribe_impl(
+    failed_chunks_to_cleanup: list[tuple[str, str]],
+    parent_dirs: set[Path],
+    failed_chunk_ids: list[str],
+    cleanup_failed: bool,
+) -> None:
+    """Unlink failed chunk files and optionally rmtree parent dirs. Shared by sync and queue paths."""
+    for chunk_path, _ in failed_chunks_to_cleanup:
+        try:
+            os.unlink(chunk_path)
+        except OSError:
+            logger.debug("Cleanup failed (unlink)")
+    if not failed_chunk_ids or cleanup_failed:
+        for d in parent_dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                logger.debug("Cleanup failed (rmtree)")
+
+
+def _transcribe_upload_ids_sync(
+    ids: list[str],
+    cleanup_failed: bool,
+    language: str,
+    clean_up: bool,
+) -> tuple[list[str], list[str], list[int], set[Path], list[tuple[str, str]]]:
+    """Run transcribe loop for upload_ids in a thread. Returns (segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup)."""
+    return _transcribe_upload_ids_impl(ids, cleanup_failed, language, clean_up, progress_callback=None)
+
+
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(
     audio: list[UploadFile] | None = File(None),
@@ -359,6 +506,11 @@ async def transcribe(
         raise HTTPException(400, "Provide either audio file(s) or upload_ids, not both")
     if not has_upload_ids and not has_files:
         raise HTTPException(400, "Provide either audio file(s) or upload_ids")
+    if has_upload_ids and len(ids) > config.TRANSCRIBE_MAX_BATCH_SIZE:
+        raise HTTPException(
+            400,
+            f"Too many chunks (max {config.TRANSCRIBE_MAX_BATCH_SIZE}). Split into smaller batches.",
+        )
 
     lang = _parse_language(language)
     do_clean_up = _parse_clean_up(clean_up)
@@ -368,85 +520,31 @@ async def transcribe(
     segments: list[str] = []
 
     if has_upload_ids:
-        segments = [""] * len(ids)
-        parent_dirs: set[Path] = set()
-        successful_ids: set[str] = set()
-        failed_chunks_to_cleanup: list[tuple[str, str]] = []  # (chunk_path, chunk_filename)
+        loop = asyncio.get_running_loop()
         try:
-            for i, uid in enumerate(ids):
-                entry = pop_upload(uid)
-                if not entry:
-                    failed_chunk_ids.append(uid)
-                    failed_chunk_indices.append(i)
-                    continue
-                chunk_path, chunk_filename = entry
-                parent_dirs.add(Path(chunk_path).parent)
-                try:
-                    chunk_bytes = Path(chunk_path).read_bytes()
-                except Exception as e:
-                    logger.exception("Failed to read chunk file: %s", e)
-                    _record_failed_chunk(
-                        chunk_path, chunk_filename, cleanup_failed,
-                        failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                    )
-                    failed_chunk_indices.append(i)
-                    continue
-                if len(chunk_bytes) == 0:
-                    _record_failed_chunk(
-                        chunk_path, chunk_filename, cleanup_failed,
-                        failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                    )
-                    failed_chunk_indices.append(i)
-                    try:
-                        os.unlink(chunk_path)
-                    except OSError:
-                        pass
-                    continue
-                try:
-                    segment_text = transcribe_svc.transcribe_audio(
-                        chunk_bytes, chunk_filename, language=lang, clean_up=do_clean_up
-                    )
-                    texts.append(segment_text)
-                    segments[i] = segment_text
-                    successful_ids.add(uid)
-                    # Success: unlink file and don't put back in store
-                    try:
-                        os.unlink(chunk_path)
-                    except OSError:
-                        pass
-                except ValueError as e:
-                    logger.exception("Transcription failed (upload_ids): %s", e)
-                    _record_failed_chunk(
-                        chunk_path, chunk_filename, cleanup_failed,
-                        failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                    )
-                    failed_chunk_indices.append(i)
-                except Exception as e:
-                    logger.exception("Transcription failed (upload_ids): %s", e)
-                    _record_failed_chunk(
-                        chunk_path, chunk_filename, cleanup_failed,
-                        failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                    )
-                    failed_chunk_indices.append(i)
-                finally:
-                    del chunk_bytes
+            (
+                segments,
+                failed_chunk_ids,
+                failed_chunk_indices,
+                parent_dirs,
+                failed_chunks_to_cleanup,
+            ) = await loop.run_in_executor(
+                None,
+                _transcribe_upload_ids_sync,
+                ids,
+                cleanup_failed,
+                lang,
+                do_clean_up,
+            )
         except StoreFullError:
             raise HTTPException(503, "Upload store full. Try again later.")
-        # Cleanup failed chunks if cleanup_failed=True
-        for chunk_path, _ in failed_chunks_to_cleanup:
-            try:
-                os.unlink(chunk_path)
-            except OSError:
-                pass
-        # Clean up parent dirs if all chunks succeeded or cleanup_failed=True
-        if not failed_chunk_ids or cleanup_failed:
-            for d in parent_dirs:
-                try:
-                    shutil.rmtree(d, ignore_errors=True)
-                except OSError:
-                    pass
+        _cleanup_after_transcribe_impl(
+            failed_chunks_to_cleanup, parent_dirs, failed_chunk_ids, cleanup_failed
+        )
     else:
-        for f in audio:
+        loop = asyncio.get_running_loop()
+
+        async def transcribe_one_file(f: UploadFile) -> str:
             if not allowed_audio_content_type(f.content_type):
                 raise HTTPException(400, "Invalid file type: audio only")
             body = await read_file_with_size_cap(
@@ -457,15 +555,22 @@ async def transcribe(
                 raise HTTPException(400, "Empty file")
             name = _sanitize_filename(f)
             try:
-                text = transcribe_svc.transcribe_audio(body, name, language=lang, clean_up=do_clean_up)
-                texts.append(text)
-            except ValueError as e:
-                raise HTTPException(503, str(e)) from e
-            except Exception as e:
-                logger.exception("Transcription failed (audio): %s", e)
-                raise HTTPException(502, "Transcription request failed") from e
+                return await loop.run_in_executor(
+                    None,
+                    lambda b=body, n=name: transcribe_svc.transcribe_audio(
+                        b, n, language=lang, clean_up=do_clean_up
+                    ),
+                )
+            except ValueError:
+                raise HTTPException(503, "Transcription service unavailable")
+            except Exception:
+                logger.error("Transcription failed (audio)")
+                logger.debug("Transcription audio exception", exc_info=True)
+                raise HTTPException(502, "Transcription request failed")
             finally:
                 del body
+
+        texts = await asyncio.gather(*[transcribe_one_file(f) for f in audio])
 
     if has_upload_ids:
         result_text = "\n\n".join(segments) if segments else ""
@@ -489,82 +594,25 @@ def _transcribe_upload_ids_to_queue(
     language: str = "auto",
     clean_up: bool = True,
 ) -> None:
-    """Run transcribe loop for upload_ids; put progress (current, total, filename) before each chunk and result at end."""
-    segments: list[str] = [""] * len(ids)
-    failed_chunk_ids: list[str] = []
-    failed_chunk_indices: list[int] = []
-    parent_dirs: set[Path] = set()
-    failed_chunks_to_cleanup: list[tuple[str, str]] = []
+    """Run transcribe loop for upload_ids; put progress before each chunk and result at end. Uses _transcribe_upload_ids_impl."""
+    def on_progress(current: int, total: int, filename: str) -> None:
+        progress_queue.put({"type": "progress", "current": current, "total": total, "filename": filename})
+
     try:
-        for i, uid in enumerate(ids):
-            entry = pop_upload(uid)
-            if not entry:
-                failed_chunk_ids.append(uid)
-                failed_chunk_indices.append(i)
-                continue
-            chunk_path, chunk_filename = entry
-            parent_dirs.add(Path(chunk_path).parent)
-            progress_queue.put({"type": "progress", "current": i + 1, "total": len(ids), "filename": chunk_filename})
-            try:
-                chunk_bytes = Path(chunk_path).read_bytes()
-            except Exception as e:
-                logger.exception("Failed to read chunk file: %s", e)
-                _record_failed_chunk(
-                    chunk_path, chunk_filename, cleanup_failed,
-                    failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                )
-                failed_chunk_indices.append(i)
-                continue
-            if len(chunk_bytes) == 0:
-                _record_failed_chunk(
-                    chunk_path, chunk_filename, cleanup_failed,
-                    failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                )
-                failed_chunk_indices.append(i)
-                try:
-                    os.unlink(chunk_path)
-                except OSError:
-                    pass
-                continue
-            try:
-                segment_text = transcribe_svc.transcribe_audio(
-                    chunk_bytes, chunk_filename, language=language, clean_up=clean_up
-                )
-                segments[i] = segment_text
-                try:
-                    os.unlink(chunk_path)
-                except OSError:
-                    pass
-            except ValueError as e:
-                logger.exception("Transcription failed (upload_ids): %s", e)
-                _record_failed_chunk(
-                    chunk_path, chunk_filename, cleanup_failed,
-                    failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                )
-                failed_chunk_indices.append(i)
-            except Exception as e:
-                logger.exception("Transcription failed (upload_ids): %s", e)
-                _record_failed_chunk(
-                    chunk_path, chunk_filename, cleanup_failed,
-                    failed_chunk_ids, uid, failed_chunks_to_cleanup,
-                )
-                failed_chunk_indices.append(i)
-            finally:
-                del chunk_bytes
+        segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup = _transcribe_upload_ids_impl(
+            ids, cleanup_failed, language, clean_up, progress_callback=on_progress
+        )
     except StoreFullError:
         progress_queue.put({"type": "error", "detail": "Upload store full. Try again later."})
         return
-    for chunk_path, _ in failed_chunks_to_cleanup:
-        try:
-            os.unlink(chunk_path)
-        except OSError:
-            pass
-    if not failed_chunk_ids or cleanup_failed:
-        for d in parent_dirs:
-            try:
-                shutil.rmtree(d, ignore_errors=True)
-            except OSError:
-                pass
+    except Exception:
+        logger.error("Transcription failed (stream)")
+        logger.debug("Transcription stream exception", exc_info=True)
+        progress_queue.put({"type": "error", "detail": "Transcription failed."})
+        return
+    _cleanup_after_transcribe_impl(
+        failed_chunks_to_cleanup, parent_dirs, failed_chunk_ids, cleanup_failed
+    )
     result_text = "\n\n".join(segments) if segments else ""
     progress_queue.put({
         "type": "result",
@@ -586,12 +634,17 @@ async def transcribe_stream(
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     if not ids:
         raise HTTPException(400, "Provide upload_ids")
+    if len(ids) > config.TRANSCRIBE_MAX_BATCH_SIZE:
+        raise HTTPException(
+            400,
+            f"Too many chunks (max {config.TRANSCRIBE_MAX_BATCH_SIZE}). Split into smaller batches.",
+        )
     progress_queue: queue.Queue = queue.Queue()
     lang = _parse_language(language)
     do_clean_up = _parse_clean_up(clean_up)
 
     async def ndjson_stream():
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         run = loop.run_in_executor(
             None,
             _transcribe_upload_ids_to_queue,
@@ -601,11 +654,17 @@ async def transcribe_stream(
             lang,
             do_clean_up,
         )
-        while True:
-            item = await loop.run_in_executor(None, progress_queue.get)
-            yield json.dumps(item, ensure_ascii=False) + "\n"
-            if item.get("type") in ("result", "error"):
-                break
+        try:
+            while True:
+                item = await loop.run_in_executor(None, progress_queue.get)
+                yield json.dumps(item, ensure_ascii=False) + "\n"
+                if item.get("type") in ("result", "error"):
+                    break
+        finally:
+            try:
+                await run
+            except Exception:
+                logger.debug("Transcribe stream executor finished with exception", exc_info=True)
 
     return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
 
@@ -618,9 +677,10 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
 
     try:
         text = translate_svc.translate_text(req.text, req.target_lang)
-    except ValueError as e:
-        raise HTTPException(503, str(e)) from e
-    except Exception as e:
-        raise HTTPException(502, "Translation request failed") from e
+    except ValueError:
+        raise HTTPException(503, "Translation service unavailable")
+    except Exception:
+        logger.debug("Translation exception", exc_info=True)
+        raise HTTPException(502, "Translation request failed")
 
     return TranslateResponse(text=text)

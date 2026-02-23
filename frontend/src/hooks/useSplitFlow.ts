@@ -42,6 +42,7 @@ export function useSplitFlow(
   const finishSplitAndClearProgress = () => {
     if (splitRevertScheduledRef.current) return;
     splitRevertScheduledRef.current = true;
+    clearAllTimeouts(splitProgressTimeoutsRef, splitFallbackTimeoutRef);
     const result = splitResultRef.current;
     if (result) onSuccess(result.chunks);
     setIsSplitting(false);
@@ -85,7 +86,7 @@ export function useSplitFlow(
       const fallbackDelayMs = (res.chunks.length - 1) * STAGGER_MS;
       splitFallbackTimeoutRef.current = setTimeout(() => finishSplitAndClearProgress(), fallbackDelayMs);
     } catch (err) {
-      if ((err as Error).name === "AbortError") onCancel();
+      if (err instanceof Error && err.name === "AbortError") onCancel();
     } finally {
       if (!completed) {
         clearAllTimeouts(splitProgressTimeoutsRef, splitFallbackTimeoutRef);

@@ -6,6 +6,7 @@
     python scan_orphaned_files.py --clean            # 扫描并清理（需要确认）
     python scan_orphaned_files.py --clean --force     # 扫描并直接清理（无需确认）
 """
+import logging
 import os
 import shutil
 import sys
@@ -13,9 +14,11 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-# 导入 upload_store（需要从 backend 目录运行）
+logger = logging.getLogger(__name__)
+
+# 导入 upload_store 公开 API（需要从 backend 目录运行）
 try:
-    from app.api.upload_store import _uploads
+    from app.api.upload_store import list_upload_entries, remove_upload_entry
 except ImportError:
     print("错误: 请从 backend 目录运行此脚本")
     print("   cd backend && python scan_orphaned_files.py")
@@ -33,18 +36,19 @@ def format_size(size: int) -> str:
 
 def scan_upload_store() -> dict:
     """扫描 upload_store 中的条目，检查文件是否存在。"""
+    entries = list_upload_entries()
     results = {
-        "total_entries": len(_uploads),
+        "total_entries": len(entries),
         "existing_files": [],
         "orphaned_entries": [],  # 条目存在但文件不存在
     }
-    
-    if not _uploads:
+
+    if not entries:
         return results
-    
-    print(f"\n📦 检查 upload_store 中的 {len(_uploads)} 个条目...")
-    
-    for upload_id, (temp_path, filename) in _uploads.items():
+
+    print(f"\n📦 检查 upload_store 中的 {len(entries)} 个条目...")
+
+    for upload_id, temp_path, filename in entries:
         if os.path.exists(temp_path):
             size = os.path.getsize(temp_path) if os.path.isfile(temp_path) else 0
             results["existing_files"].append({
@@ -195,18 +199,15 @@ def clean_orphaned_files(
         print(f"\n  清理 upload_store 条目...")
         for item in upload_store_results["existing_files"]:
             try:
-                if os.path.exists(item["path"]):
-                    os.unlink(item["path"])
-                # 从 _uploads 中删除（如果还在）
-                _uploads.pop(item["upload_id"], None)
-                cleaned["upload_store_entries"] += 1
+                if remove_upload_entry(item["upload_id"]):
+                    cleaned["upload_store_entries"] += 1
             except Exception as e:
+                logger.debug("Remove upload_store entry failed", exc_info=True)
                 cleaned["errors"].append(f"删除 {item['path']}: {e}")
-        
+
         for item in upload_store_results["orphaned_entries"]:
-            # 只从 _uploads 中删除
-            _uploads.pop(item["upload_id"], None)
-            cleaned["upload_store_entries"] += 1
+            if remove_upload_entry(item["upload_id"]):
+                cleaned["upload_store_entries"] += 1
     
     # 清理临时目录中的 upload_* 文件
     if temp_dir_results["upload_files"]:
@@ -216,6 +217,7 @@ def clean_orphaned_files(
                 os.unlink(item["path"])
                 cleaned["upload_files"] += 1
             except Exception as e:
+                logger.debug("Unlink upload file failed", exc_info=True)
                 cleaned["errors"].append(f"删除 {item['path']}: {e}")
     
     # 清理临时目录中的 audio_split_* 目录
@@ -226,6 +228,7 @@ def clean_orphaned_files(
                 shutil.rmtree(item["path"], ignore_errors=True)
                 cleaned["audio_split_dirs"] += 1
             except Exception as e:
+                logger.debug("Rmtree audio_split dir failed", exc_info=True)
                 cleaned["errors"].append(f"删除 {item['path']}: {e}")
     
     print("\n✅ 清理完成！")

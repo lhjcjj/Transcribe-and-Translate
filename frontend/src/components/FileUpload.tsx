@@ -1,38 +1,92 @@
-import { useRef } from "react";
+import { RefObject } from "react";
 
-const ACCEPT = "audio/mpeg,audio/mp3,audio/wav,audio/webm,audio/mp4,audio/x-m4a,audio/*";
-
-interface FileUploadProps {
-  onSelect: (file: File) => void;
-  disabled?: boolean;
-  loading?: boolean;
+export interface FileUploadProps {
+  inputRef: RefObject<HTMLInputElement>;
+  fileName: string;
+  fileSizeAddon: React.ReactNode;
+  hasFile: boolean;
+  disabled: boolean;
+  onFileChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onClear: () => void;
+  onBrowse: () => void;
+  uploadButtonDisabled: boolean;
+  uploadButtonText: string;
+  onUploadOrCancel: () => void;
 }
 
-export function FileUpload({ onSelect, disabled, loading }: FileUploadProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
-
+export function FileUpload({
+  inputRef,
+  fileName,
+  fileSizeAddon,
+  hasFile,
+  disabled,
+  onFileChange,
+  onClear,
+  onBrowse,
+  uploadButtonDisabled,
+  uploadButtonText,
+  onUploadOrCancel,
+}: FileUploadProps) {
   return (
-    <div className="section">
-      <label className="label">Audio file</label>
-      <input
-        ref={inputRef}
-        type="file"
-        accept={ACCEPT}
-        disabled={disabled}
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onSelect(f);
-          e.target.value = "";
-        }}
-        style={{ display: "none" }}
-      />
-      <button
-        type="button"
-        disabled={disabled || loading}
-        onClick={() => inputRef.current?.click()}
-      >
-        {loading ? "Transcribing…" : "Choose file"}
-      </button>
-    </div>
+    <section className="step">
+      <div className="step-head">
+        <span className="step-title">①    Upload audio files:</span>
+        <div className="step-row">
+          <div className="step-wrap">
+            <p className="step-desc">default</p>
+            <div className="step-inner">
+              <input
+                ref={inputRef}
+                type="file"
+                accept="audio/*,.mp3,.wav,.m4a,.ogg,.webm,.flac"
+                aria-hidden="true"
+                tabIndex={-1}
+                style={{ position: "absolute", width: 0, height: 0, opacity: 0, pointerEvents: "none" }}
+                onChange={onFileChange}
+                disabled={disabled}
+              />
+              <input
+                type="text"
+                id="step-upload-input"
+                name="audio-file"
+                className={`step-input${fileName ? " step-input-has-file" : ""}`}
+                placeholder="Select an audio file to upload"
+                readOnly
+                value={fileName}
+                disabled={disabled}
+                aria-label="Selected audio file name"
+              />
+              {hasFile && !disabled ? (
+                <button
+                  type="button"
+                  className="step-upload-clear"
+                  onClick={onClear}
+                  aria-label="Clear selected file"
+                >
+                  ×
+                </button>
+              ) : null}
+              <span className="step-input-addon">{fileSizeAddon}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="step-upload-browse"
+            onClick={onBrowse}
+            disabled={disabled}
+          >
+            browse
+          </button>
+          <button
+            type="button"
+            className="step-upload-upload"
+            disabled={uploadButtonDisabled}
+            onClick={onUploadOrCancel}
+          >
+            {uploadButtonText}
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }

@@ -2,9 +2,9 @@ from pydantic import BaseModel, Field
 
 
 class UploadChunkItem(BaseModel):
-    """One chunk produced by split. Use upload_id in POST /api/transcribe to transcribe this chunk."""
+    """One chunk produced by split. Use upload_id in POST /api/transcribe to transcribe this chunk. path is not sent to client (internal only)."""
 
-    path: str = Field(..., description="Server path to the chunk file")
+    path: str = Field("", description="Server path (internal); not exposed to client")
     filename: str = Field(..., description="Suggested filename for the chunk")
     upload_id: str = Field(..., description="Id to pass to transcribe (chunk file)")
 
@@ -22,6 +22,12 @@ class UploadDurationResponse(BaseModel):
     duration_seconds: float = Field(..., description="Total duration in seconds")
 
 
+class UploadConfigResponse(BaseModel):
+    """Public upload limits (single source of truth; backend config)."""
+
+    max_upload_bytes: int = Field(..., description="Max upload size in bytes (e.g. 100MB)")
+
+
 class SplitRequest(BaseModel):
     """Request body for POST /api/split."""
 
@@ -30,7 +36,7 @@ class SplitRequest(BaseModel):
 
 
 class SplitResponse(BaseModel):
-    """Response after split. Caller must delete temp_dir when done (e.g. shutil.rmtree)."""
+    """Response after split. temp_dir is not exposed to client (internal cleanup only)."""
 
-    temp_dir: str = Field(..., description="Temporary directory containing chunk files")
+    temp_dir: str = Field("", description="Internal; not exposed to client")
     chunks: list[UploadChunkItem] = Field(..., description="Chunk files in time order")

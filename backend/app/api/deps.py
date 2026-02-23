@@ -2,9 +2,22 @@
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import UploadFile
+from fastapi import HTTPException, Request, UploadFile
 
 from app import config
+
+
+def require_api_key(request: Request) -> None:
+    """When API_KEY is set, require X-API-Key or Authorization: Bearer to match. Otherwise no-op."""
+    if not config.API_KEY:
+        return
+    key = request.headers.get("X-API-Key") or ""
+    if not key and request.headers.get("Authorization"):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            key = auth[7:].strip()
+    if key != config.API_KEY:
+        raise HTTPException(401, "Missing or invalid API key")
 
 
 # Chunk size for streaming read when capping upload size
@@ -35,5 +48,6 @@ async def read_file_with_size_cap(
         if total > max_bytes:
             del chunks_buf
             reject_413()
+            return  # never returns; reject_413() raises
         chunks_buf.append(chunk)
     return b"".join(chunks_buf)

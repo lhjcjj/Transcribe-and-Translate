@@ -1,9 +1,8 @@
 """Load configuration from environment variables. No secret defaults."""
 import os
-from typing import List
 
 
-def _str_list(value: str | None) -> List[str]:
+def _str_list(value: str | None) -> list[str]:
     if not value or not value.strip():
         return []
     return [s.strip() for s in value.split(",") if s.strip()]
@@ -30,8 +29,30 @@ CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "900")
 # Orphan audio_split_* dirs older than this (seconds) are deleted by periodic cleanup (default 1 hour)
 AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS = int(os.environ.get("AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS", "3600"))
 
+# Max concurrent split operations (1 = serial; >1 allows N splits in parallel). Limits peak memory.
+SPLIT_MAX_CONCURRENT = max(1, int(os.environ.get("SPLIT_MAX_CONCURRENT", "4")))
+
+# Max concurrent uploads (1 = serial; >1 allows N uploads in parallel). Limits peak memory when reading body.
+UPLOAD_MAX_CONCURRENT = max(1, int(os.environ.get("UPLOAD_MAX_CONCURRENT", "4")))
+
+# Max concurrent calls to transcription API (Whisper). Respects provider rate/concurrency limits.
+TRANSCRIBE_MAX_CONCURRENT = max(1, int(os.environ.get("TRANSCRIBE_MAX_CONCURRENT", "4")))
+
+# Retry backoff (seconds): base * 2^attempt, capped by max. Reduces thread hold time in executor.
+TRANSCRIBE_RETRY_BASE_SECONDS = float(os.environ.get("TRANSCRIBE_RETRY_BASE_SECONDS", "0.5"))
+TRANSCRIBE_RETRY_MAX_WAIT_SECONDS = float(os.environ.get("TRANSCRIBE_RETRY_MAX_WAIT_SECONDS", "2.0"))
+
+# Max number of chunk upload_ids per transcribe request; rejects with 400 when exceeded to avoid long-running single request.
+TRANSCRIBE_MAX_BATCH_SIZE = max(1, int(os.environ.get("TRANSCRIBE_MAX_BATCH_SIZE", "300")))
+
+# Max retries for transcription API on connection errors.
+TRANSCRIBE_MAX_RETRIES = max(1, int(os.environ.get("TRANSCRIBE_MAX_RETRIES", "3")))
+
+# Optional API key for /api: when set, every request must send X-API-Key or Authorization: Bearer <key>. Leave empty for no auth (e.g. local only).
+API_KEY = (os.environ.get("API_KEY") or os.environ.get("BACKEND_API_KEY") or "").strip()
+
 # CORS: comma-separated origins; default for local dev
-ALLOWED_ORIGINS: List[str] = _str_list(
+ALLOWED_ORIGINS: list[str] = _str_list(
     os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000")
 )
 

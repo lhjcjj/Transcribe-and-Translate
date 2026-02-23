@@ -2,6 +2,8 @@
 Entries expire after UPLOAD_TTL_SECONDS; expired entries are removed on get or by periodic cleanup.
 Duplicate detection: (filename, size) -> upload_id; if same filename and size already stored, return existing upload_id.
 Thread-safe for concurrent request handlers."""
+import asyncio
+import logging
 import os
 import shutil
 import tempfile
@@ -10,7 +12,14 @@ import time
 import uuid
 from typing import Optional
 
-from app.config import UPLOAD_TTL_SECONDS, AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS, STORE_MAX_ENTRIES
+logger = logging.getLogger(__name__)
+
+from app.config import (
+    UPLOAD_MAX_CONCURRENT,
+    UPLOAD_TTL_SECONDS,
+    AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS,
+    STORE_MAX_ENTRIES,
+)
 
 
 class StoreFullError(Exception):
@@ -26,6 +35,9 @@ _store_lock = threading.RLock()
 _uploads: dict[str, tuple[str, str, float]] = {}  # upload_id -> (temp_path, filename, created_at)
 _by_name_size: dict[tuple[str, int], str] = {}  # (filename, size) -> upload_id
 
+# Limit concurrent uploads (read body + save) to control peak memory. Use in route: async with upload_semaphore: ...
+upload_semaphore = asyncio.Semaphore(UPLOAD_MAX_CONCURRENT)
+
 
 def _remove_entry(upload_id: str, path: str, filename: str) -> None:
     """Remove one entry from store and delete temp file. Idempotent for missing key/file."""
@@ -34,11 +46,11 @@ def _remove_entry(upload_id: str, path: str, filename: str) -> None:
         size = os.path.getsize(path)
         _by_name_size.pop((filename, size), None)
     except OSError:
-        pass
+        logger.debug("Cleanup failed (getsize/pop)")
     try:
         os.unlink(path)
     except OSError:
-        pass
+        logger.debug("Cleanup failed (unlink)")
 
 
 def put_upload(temp_path: str, filename: str, size: int) -> str:
@@ -76,8 +88,33 @@ def pop_upload(upload_id: str) -> Optional[tuple[str, str]]:
             size = os.path.getsize(path)
             _by_name_size.pop((filename, size), None)
         except OSError:
-            pass
+            logger.debug("Cleanup failed")
         return (path, filename)
+
+
+def list_upload_entries() -> list[tuple[str, str, str]]:
+    """Return snapshot of entries (upload_id, temp_path, filename) for tooling (e.g. scan script)."""
+    with _store_lock:
+        return [(uid, path, fn) for uid, (path, fn, _) in _uploads.items()]
+
+
+def remove_upload_entry(upload_id: str) -> bool:
+    """Remove one entry from store and delete its temp file. Returns True if entry existed. For tooling (e.g. scan script)."""
+    with _store_lock:
+        entry = _uploads.pop(upload_id, None)
+        if not entry:
+            return False
+        path, filename, _ = entry
+        try:
+            size = os.path.getsize(path)
+            _by_name_size.pop((filename, size), None)
+        except OSError:
+            logger.debug("Cleanup failed")
+        try:
+            os.unlink(path)
+        except OSError:
+            logger.debug("Cleanup failed")
+        return True
 
 
 def save_upload_bytes(body: bytes, filename: str) -> str:
@@ -103,10 +140,11 @@ def save_upload_bytes(body: bytes, filename: str) -> str:
             os.close(fd)
         return put_upload(path, filename, size)
     except Exception:
+        logger.debug("save_upload_bytes failed", exc_info=True)
         try:
             os.unlink(path)
         except OSError:
-            pass
+            logger.debug("Cleanup failed")
         raise
 
 
@@ -133,14 +171,37 @@ def _is_spool_temp_filename(name: str) -> bool:
     return all(c.isalnum() or c == "_" for c in suffix)
 
 
+def _delete_orphaned_spool_temp_files(
+    temp_dir: str,
+    max_age_seconds: float,
+    names: Optional[list[str]] = None,
+) -> None:
+    """Delete tmp* spool files in temp_dir older than max_age_seconds. If names is None, listdir(temp_dir); else use provided names (single listdir pass)."""
+    if names is None:
+        try:
+            names = os.listdir(temp_dir)
+        except OSError:
+            return
+    now = time.time()
+    for name in names:
+        if not _is_spool_temp_filename(name):
+            continue
+        full = os.path.join(temp_dir, name)
+        try:
+            if os.path.isfile(full) and now - os.path.getmtime(full) > max_age_seconds:
+                os.unlink(full)
+        except OSError:
+            logger.debug("Cleanup failed")
+
+
 def cleanup_orphaned_temp_files() -> None:
     """Delete orphan temp files from system temp dir: upload_* files, audio_split_* dirs, and old tmp* spool files (single listdir pass)."""
     temp_dir = tempfile.gettempdir()
     try:
         names = os.listdir(temp_dir)
     except OSError:
+        logger.debug("listdir temp_dir failed")
         return
-    now = time.time()
     for name in names:
         full = os.path.join(temp_dir, name)
         try:
@@ -148,30 +209,14 @@ def cleanup_orphaned_temp_files() -> None:
                 os.unlink(full)
             elif name.startswith("audio_split_") and os.path.isdir(full):
                 shutil.rmtree(full, ignore_errors=True)
-            elif _is_spool_temp_filename(name) and os.path.isfile(full):
-                if now - os.path.getmtime(full) > AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS:
-                    os.unlink(full)
         except OSError:
-            pass
+            logger.debug("Cleanup failed")
+    _delete_orphaned_spool_temp_files(temp_dir, AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS, names=names)
 
 
 def cleanup_orphaned_spool_temp_files() -> None:
-    """Delete Starlette spool temp files (tmp*) older than AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS. Wraps shared logic for periodic cleanup."""
-    temp_dir = tempfile.gettempdir()
-    try:
-        names = os.listdir(temp_dir)
-    except OSError:
-        return
-    now = time.time()
-    for name in names:
-        if not _is_spool_temp_filename(name):
-            continue
-        full = os.path.join(temp_dir, name)
-        try:
-            if os.path.isfile(full) and now - os.path.getmtime(full) > AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS:
-                os.unlink(full)
-        except OSError:
-            pass
+    """Delete Starlette spool temp files (tmp*) older than AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS. Uses shared _delete_orphaned_spool_temp_files."""
+    _delete_orphaned_spool_temp_files(tempfile.gettempdir(), AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS)
 
 
 def cleanup_orphaned_audio_split_dirs() -> None:
@@ -186,6 +231,7 @@ def cleanup_orphaned_audio_split_dirs() -> None:
     try:
         names = os.listdir(temp_dir)
     except OSError:
+        logger.debug("listdir temp_dir failed")
         return
     now = time.time()
     for name in names:
@@ -201,4 +247,4 @@ def cleanup_orphaned_audio_split_dirs() -> None:
             if now - mtime > AUDIO_SPLIT_ORPHAN_MAX_AGE_SECONDS:
                 shutil.rmtree(full, ignore_errors=True)
         except OSError:
-            pass
+            logger.debug("Cleanup failed")

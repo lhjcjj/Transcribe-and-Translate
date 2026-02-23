@@ -69,6 +69,19 @@ function downloadBaseName(uploadFileName: string): string {
   return nameWithoutExt.replace(/[/\\:*?"<>|]/g, "_") || "transcribe";
 }
 
+/** Format Unix timestamp (seconds) as yyyy-mm-dd hh:mm:ss. Returns empty string if null. */
+function formatCreatedAt(createdAt: number | null): string {
+  if (createdAt == null) return "";
+  const d = new Date(createdAt * 1000);
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  return `${y}-${mo}-${day} ${h}:${min}:${s}`;
+}
+
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
@@ -884,6 +897,7 @@ export default function App() {
                       {historyItems.map((item) => (
                         <li key={item.id} className="history-item">
                           <span className="history-item-name">{item.display_name}</span>
+                          <span className="history-item-time">{formatCreatedAt(item.created_at)}</span>
                           <span className="history-item-actions">
                             <button type="button" className="history-item-download" onClick={() => { setPendingHistoryDownload(item); setShowDownloadDialog(true); }}>download</button>
                             <button type="button" className="history-item-delete" onClick={() => setPendingDeleteItem(item)}>delete</button>

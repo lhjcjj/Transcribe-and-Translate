@@ -24,13 +24,14 @@ chmod +x scripts/sync-version.sh   # 首次需要
 
 1. **改版本号**：编辑 `VERSION`，例如 `1.0.1` → `1.0.2`
 2. **同步**：`./scripts/sync-version.sh`
-3. **提交并 push**：
+3. **查看修改**：`git add -A`
+4. **提交所有并 push**：
    ```bash
-   git add VERSION frontend/package.json backend/app/main.py
+   git add -A
    git commit -m "v1.0.2"
    git push origin main
    ```
-4. **（可选）打 tag**：
+5. **（可选）打 tag**：
    ```bash
    git tag v1.0.2
    git push origin v1.0.2

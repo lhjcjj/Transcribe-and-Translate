@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { jsPDF } from "jspdf";
 import {
   cancelSplitStream,
+  deleteTranscription,
   deleteUpload,
+  getTranscription,
   getUploadConfig,
   getUploadDuration,
+  listTranscriptions,
   transcribe,
   transcribeByUploadIdsStream,
   upload,
   TranscribeApiResult,
+  TranscriptionListItem,
 } from "./api/client";
 import { FileUpload } from "./components/FileUpload";
 import { TranscribeResult } from "./components/TranscribeResult";
@@ -49,6 +54,21 @@ function clampChunkInput(raw: string): string {
   return raw;
 }
 
+/** Split a long line into chunks of at most maxLen (for PDF fallback when splitTextToSize is unavailable). */
+function matchChunks(line: string, maxLen: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < line.length; i += maxLen) out.push(line.slice(i, i + maxLen));
+  return out;
+}
+
+/** Base name for download file: upload file name without extension, or "transcribe" if none. Sanitized for filesystem. */
+function downloadBaseName(uploadFileName: string): string {
+  const base = uploadFileName.trim() || "transcribe";
+  const lastDot = base.lastIndexOf(".");
+  const nameWithoutExt = lastDot > 0 ? base.slice(0, lastDot) : base;
+  return nameWithoutExt.replace(/[/\\:*?"<>|]/g, "_") || "transcribe";
+}
+
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
@@ -61,7 +81,7 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 export default function App() {
   const [langOption, setLangOption] = useState<"auto" | "en" | "zh">("auto");
   const [cleanOption, setCleanOption] = useState<"yes" | "no">("yes");
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(true);
   const [uploadFileName, setUploadFileName] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadId, setUploadId] = useState<string | null>(null);
@@ -85,6 +105,14 @@ export default function App() {
     total: number;
     filename: string;
   } | null>(null);
+  const [showDownloadDialog, setShowDownloadDialog] = useState(false);
+  /** When set, download dialog is for this history item (PDF/TXT); when null, for current transcribe result. */
+  const [pendingHistoryDownload, setPendingHistoryDownload] = useState<TranscriptionListItem | null>(null);
+  const [pendingDeleteItem, setPendingDeleteItem] = useState<TranscriptionListItem | null>(null);
+  const [historyItems, setHistoryItems] = useState<TranscriptionListItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const apiAbortRef = useRef<AbortController | null>(null);
@@ -107,6 +135,48 @@ export default function App() {
       if (downloadRevokeTimeoutRef.current) clearTimeout(downloadRevokeTimeoutRef.current);
     };
   }, []);
+
+  const HISTORY_PAGE_SIZE = 50;
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    setHistoryLoading(true);
+    setHistoryHasMore(true);
+    listTranscriptions({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+      .then((data) => {
+        setHistoryItems(data);
+        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+      })
+      .catch(() => setHistoryItems([]))
+      .finally(() => setHistoryLoading(false));
+  }, [historyOpen]);
+
+  // After a successful transcribe, refresh history list if panel is open so the new item appears.
+  useEffect(() => {
+    if (!historyOpen || !transcribeText) return;
+    listTranscriptions({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+      .then((data) => {
+        setHistoryItems(data);
+        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+      })
+      .catch(() => {});
+  }, [historyOpen, transcribeText]);
+
+  const handleHistoryLoadMore = useCallback(() => {
+    if (historyLoadingMore || !historyHasMore) return;
+    setHistoryLoadingMore(true);
+    listTranscriptions({
+      limit: HISTORY_PAGE_SIZE,
+      offset: historyItems.length,
+      signal: apiAbortRef.current?.signal,
+    })
+      .then((data) => {
+        setHistoryItems((prev) => [...prev, ...data]);
+        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+      })
+      .catch(() => {})
+      .finally(() => setHistoryLoadingMore(false));
+  }, [historyLoadingMore, historyHasMore, historyItems.length]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -429,6 +499,7 @@ export default function App() {
               cleanupFailed: false,
               language: langOption,
               cleanUp: cleanOption === "yes",
+              displayName: uploadFileName,
               signal: controller.signal,
             }
           );
@@ -437,6 +508,7 @@ export default function App() {
           result = await transcribe(file, {
             language: langOption,
             cleanUp: cleanOption === "yes",
+            displayName: file.name,
             signal: controller.signal,
           });
         }
@@ -468,26 +540,112 @@ export default function App() {
       splitChunkIds,
       selectedFile,
       uploadId,
+      uploadFileName,
       langOption,
       cleanOption,
       deleteUploadAndClearUploadState,
     ]
   );
 
-  const handleDownloadTranscribe = useCallback(() => {
-    if (!transcribeText) return;
+  /** Shared download: generate PDF or TXT from text and trigger download. Used by main transcribe and history. */
+  const doDownload = useCallback((text: string, format: "pdf" | "txt", filenameBase: string) => {
     if (downloadRevokeTimeoutRef.current) clearTimeout(downloadRevokeTimeoutRef.current);
-    const blob = new Blob([transcribeText], { type: "text/plain;charset=utf-8" });
+
+    if (format === "pdf") {
+      const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const margin = 20;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const maxLineWidth = pageWidth - margin * 2;
+      const lineHeight = 10;
+      let y = margin;
+
+      if (filenameBase) {
+        doc.setFontSize(14);
+        doc.setFont("helvetica", "bold");
+        const titleLines =
+          typeof doc.splitTextToSize === "function"
+            ? doc.splitTextToSize(filenameBase, maxLineWidth)
+            : [filenameBase];
+        for (const titleLine of titleLines) {
+          doc.text(titleLine, margin, y);
+          y += lineHeight;
+        }
+        y += lineHeight;
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(10);
+      }
+
+      const paragraphs = text.split(/\n\n+/);
+      for (const para of paragraphs) {
+        const lines =
+          typeof doc.splitTextToSize === "function"
+            ? doc.splitTextToSize(para, maxLineWidth)
+            : para.split(/\n/).flatMap((line) => (line.length > 80 ? matchChunks(line, 80) : [line]));
+        for (const line of lines) {
+          if (y > pageHeight - margin) {
+            doc.addPage();
+            y = margin;
+          }
+          doc.text(line, margin, y);
+          y += lineHeight;
+        }
+        y += lineHeight;
+      }
+      const blob = doc.output("blob");
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${downloadBaseName(filenameBase)}.pdf`;
+      a.click();
+      downloadRevokeTimeoutRef.current = setTimeout(() => {
+        URL.revokeObjectURL(url);
+        downloadRevokeTimeoutRef.current = null;
+      }, DOWNLOAD_REVOKE_DELAY_MS);
+      return;
+    }
+
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "transcript.txt";
+    a.download = `${downloadBaseName(filenameBase)}.txt`;
     a.click();
     downloadRevokeTimeoutRef.current = setTimeout(() => {
       URL.revokeObjectURL(url);
       downloadRevokeTimeoutRef.current = null;
     }, DOWNLOAD_REVOKE_DELAY_MS);
-  }, [transcribeText]);
+  }, []);
+
+  const handleDownloadTranscribe = useCallback((format: "txt" | "pdf") => {
+    if (!transcribeText) return;
+    doDownload(transcribeText, format, downloadBaseName(uploadFileName));
+  }, [transcribeText, uploadFileName, doDownload]);
+
+  const handleDownloadDialogChoose = useCallback(async (format: "pdf" | "txt") => {
+    const item = pendingHistoryDownload;
+    setShowDownloadDialog(false);
+    setPendingHistoryDownload(null);
+    if (item) {
+      try {
+        const detail = await getTranscription(item.id, { signal: apiAbortRef.current?.signal });
+        doDownload(detail.text, format, item.display_name);
+      } catch {
+        // Error from getTranscription; dialog already closed
+      }
+      return;
+    }
+    if (transcribeText) doDownload(transcribeText, format, downloadBaseName(uploadFileName));
+  }, [pendingHistoryDownload, transcribeText, uploadFileName, doDownload]);
+
+  const handleHistoryDelete = useCallback(async (item: TranscriptionListItem) => {
+    try {
+      await deleteTranscription(item.id, { signal: apiAbortRef.current?.signal });
+      setHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
+    } catch {
+      // Error already user-facing from deleteTranscription; keep list unchanged
+    }
+  }, []);
 
   const handleRetryFailedChunks = useCallback(
     async () => {
@@ -506,6 +664,7 @@ export default function App() {
             cleanupFailed: false,
             language: langOption,
             cleanUp: cleanOption === "yes",
+            displayName: uploadFileName,
             signal: controller.signal,
           }
         );
@@ -574,7 +733,7 @@ export default function App() {
           <a href="#" className="btn-signup">sign up</a>
           <a href="#" className="btn-login">log in</a>
           <p className="notice">
-            Notices: 2026.01.01 Release Transcribe and Translate Tool, transcribe audios to texts, and translate English to Chinese.
+            Notices: 2026.02.23 Release Transcribe and Translate Tool v1.0.3
           </p>
         </header>
 
@@ -588,8 +747,8 @@ export default function App() {
             <h1 className="main-title">Transcribe and Translate</h1>
 
             <div className="intro">
-              <span className="intro-label">Introduction：</span>
-              <span className="intro-placeholder">………………………………………………………………………………………………………………………………………………………………………………………………</span>
+              <span className="intro-label">Introduction: </span>
+              <span className="intro-placeholder">Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt</span>
             </div>
 
             <div className="steps">
@@ -703,7 +862,7 @@ export default function App() {
                     >
                       {isTranscribing ? "transcribing…" : failedChunkIds?.length ? "retry failed" : "transcribe"}
                     </button>
-                    <button type="button" className="step-transcribe-download" disabled={!transcribeText} onClick={handleDownloadTranscribe}>download</button>
+                    <button type="button" className="step-transcribe-download" disabled={!transcribeText} onClick={() => { setPendingHistoryDownload(null); setShowDownloadDialog(true); }}>download</button>
                   </div>
                 </div>
                 <TranscribeResult text={transcribeText} error={transcribeError} />
@@ -716,7 +875,30 @@ export default function App() {
               </button>
               {historyOpen && (
                 <ul className="history-list">
-                  <li className="history-list-empty">No files yet</li>
+                  {historyLoading ? (
+                    <li className="history-list-empty">Loading…</li>
+                  ) : historyItems.length === 0 ? (
+                    <li className="history-list-empty">No files yet</li>
+                  ) : (
+                    <>
+                      {historyItems.map((item) => (
+                        <li key={item.id} className="history-item">
+                          <span className="history-item-name">{item.display_name}</span>
+                          <span className="history-item-actions">
+                            <button type="button" className="history-item-download" onClick={() => { setPendingHistoryDownload(item); setShowDownloadDialog(true); }}>download</button>
+                            <button type="button" className="history-item-delete" onClick={() => setPendingDeleteItem(item)}>delete</button>
+                          </span>
+                        </li>
+                      ))}
+                      {historyHasMore && (
+                        <li className="history-list-load-more">
+                          <button type="button" className="history-load-more-btn" disabled={historyLoadingMore} onClick={handleHistoryLoadMore}>
+                            {historyLoadingMore ? "Loading…" : "Load more"}
+                          </button>
+                        </li>
+                      )}
+                    </>
+                  )}
                 </ul>
               )}
             </div>
@@ -736,6 +918,48 @@ export default function App() {
               </button>
               <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setConfirmCancelType(null)}>
                 No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingDeleteItem !== null && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+          <div className="confirm-dialog">
+            <p id="delete-confirm-title" className="confirm-text">Do you want to delete?</p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-yes"
+                onClick={async () => {
+                  await handleHistoryDelete(pendingDeleteItem);
+                  setPendingDeleteItem(null);
+                }}
+              >
+                Yes
+              </button>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPendingDeleteItem(null)}>
+                No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDownloadDialog && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="download-dialog-title">
+          <div className="confirm-dialog">
+            <p id="download-dialog-title" className="confirm-text">Choose file type.</p>
+            <div className="confirm-actions">
+              <button type="button" className="confirm-btn confirm-btn-yes" onClick={() => handleDownloadDialogChoose("pdf")}>
+                PDF
+              </button>
+              <button type="button" className="confirm-btn confirm-btn-yes" onClick={() => handleDownloadDialogChoose("txt")}>
+                TXT
+              </button>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => { setShowDownloadDialog(false); setPendingHistoryDownload(null); }}>
+                Cancel
               </button>
             </div>
           </div>

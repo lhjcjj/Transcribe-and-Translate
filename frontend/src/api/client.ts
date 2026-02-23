@@ -264,7 +264,7 @@ export interface TranscribeApiResult {
 
 export async function transcribe(
   file: File,
-  options?: { language?: string; cleanUp?: boolean; signal?: AbortSignal }
+  options?: { language?: string; cleanUp?: boolean; displayName?: string; signal?: AbortSignal }
 ): Promise<TranscribeApiResult> {
   const form = new FormData();
   form.append("audio", file);
@@ -272,6 +272,9 @@ export async function transcribe(
     form.append("language", options.language);
   }
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
+  if (options?.displayName != null && options.displayName.trim() !== "") {
+    form.append("display_name", options.displayName.trim());
+  }
   const res = await fetch(`${API_BASE}/api/transcribe`, {
     method: "POST",
     headers: getApiHeaders(),
@@ -289,7 +292,7 @@ export type TranscribeChunkProgress = { current: number; total: number; filename
 export async function transcribeByUploadIdsStream(
   uploadIds: string[],
   onProgress: (current: number, total: number, filename: string) => void,
-  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean; signal?: AbortSignal }
+  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean; displayName?: string; signal?: AbortSignal }
 ): Promise<TranscribeApiResult> {
   const form = new FormData();
   uploadIds.forEach((id) => form.append("upload_ids", id));
@@ -298,6 +301,9 @@ export async function transcribeByUploadIdsStream(
     form.append("language", options.language);
   }
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
+  if (options?.displayName != null && options.displayName.trim() !== "") {
+    form.append("display_name", options.displayName.trim());
+  }
   const res = await fetch(`${API_BASE}/api/transcribe/stream`, {
     method: "POST",
     headers: getApiHeaders(),
@@ -366,18 +372,63 @@ export async function transcribeByUploadIdsStream(
   return result;
 }
 
-export async function translate(
-  text: string,
-  targetLang: string,
-  options?: { signal?: AbortSignal }
-): Promise<{ text: string }> {
-  const res = await jsonPost(
-    "/api/translate",
-    { text, target_lang: targetLang },
-    options
+/** Transcription history list item (metadata only). */
+export interface TranscriptionListItem {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+}
+
+/** Full transcription for get/download. */
+export interface TranscriptionDetail {
+  id: string;
+  created_at: number | null;
+  text: string;
+  meta: Record<string, unknown> | null;
+}
+
+export async function listTranscriptions(
+  options?: { limit?: number; offset?: number; signal?: AbortSignal }
+): Promise<TranscriptionListItem[]> {
+  const limit = options?.limit ?? 50;
+  const offset = options?.offset ?? 0;
+  const res = await fetch(
+    `${API_BASE}/api/transcriptions?limit=${Math.min(100, Math.max(1, limit))}&offset=${Math.max(0, offset)}`,
+    {
+      headers: getApiHeaders(),
+      signal: options?.signal,
+    }
   );
   if (!res.ok) {
-    throw new Error(await getErrorMessageFromResponse(res, "Translation failed"));
+    throw new Error(await getErrorMessageFromResponse(res, "List transcriptions failed"));
   }
   return res.json();
+}
+
+export async function getTranscription(
+  transcriptionId: string,
+  options?: { signal?: AbortSignal }
+): Promise<TranscriptionDetail> {
+  const res = await fetch(`${API_BASE}/api/transcriptions/${encodeURIComponent(transcriptionId)}`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Get transcription failed"));
+  }
+  return res.json();
+}
+
+export async function deleteTranscription(
+  transcriptionId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/transcriptions/${encodeURIComponent(transcriptionId)}`, {
+    method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await getErrorMessageFromResponse(res, "Delete transcription failed"));
+  }
 }

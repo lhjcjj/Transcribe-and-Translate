@@ -34,6 +34,8 @@ from app.api.upload_store import (
     upload_semaphore,
 )
 from app.schemas.transcribe import TranscribeResponse
+from app.schemas.transcription_history import TranscriptionDetail, TranscriptionListItem
+from app.api import transcription_history
 from app.schemas.translate import TranslateRequest, TranslateResponse
 from app.services import audio_split as audio_split_svc
 from app.services import transcribe as transcribe_svc
@@ -72,6 +74,16 @@ FILENAME_ALLOWED_PATTERN = re.compile(r"[a-zA-Z0-9._\s\-\u4e00-\u9fff]+")
 def _reject_413(message: str) -> None:
     """Raise HTTP 413 with the given message (caller never returns)."""
     raise HTTPException(413, message)
+
+
+def _chunk_filename_to_original(chunk_filename: str) -> str:
+    """If chunk_filename matches split pattern '{base}_part_{NNN}{ext}', return '{base}{ext}' (original upload name). Else return as-is."""
+    if not chunk_filename:
+        return chunk_filename
+    m = re.match(r"^(.+)_part_\d{1,5}(\.[a-zA-Z0-9]+)$", chunk_filename)
+    if m:
+        return m.group(1) + m.group(2)
+    return chunk_filename
 
 
 def _sanitize_filename(audio: UploadFile) -> str:
@@ -496,8 +508,9 @@ async def transcribe(
     cleanup_failed: bool = Form(False),
     language: str | None = Form(None),
     clean_up: str | None = Form(None),
+    display_name: str | None = Form(None),
 ) -> TranscribeResponse:
-    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
+    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     has_upload_ids = len(ids) > 0
     has_files = audio and len(audio) > 0
@@ -542,6 +555,7 @@ async def transcribe(
             failed_chunks_to_cleanup, parent_dirs, failed_chunk_ids, cleanup_failed
         )
     else:
+        # Direct audio upload: transcribe one or more files in executor threads.
         loop = asyncio.get_running_loop()
 
         async def transcribe_one_file(f: UploadFile) -> str:
@@ -574,13 +588,44 @@ async def transcribe(
 
     if has_upload_ids:
         result_text = "\n\n".join(segments) if segments else ""
+        disp = (display_name or "").strip() if display_name else ""
+        if not disp and ids:
+            first_info = get_upload(ids[0])
+            if first_info:
+                disp = _chunk_filename_to_original(first_info[1])
+        transcription_history.save_transcription(
+            result_text,
+            {
+                "source": "upload_ids",
+                "upload_ids": ids,
+                "language": lang,
+                "clean_up": do_clean_up,
+                "failed_chunk_ids": failed_chunk_ids or None,
+                "failed_chunk_indices": failed_chunk_indices or None,
+                "display_name": disp,
+            },
+        )
         return TranscribeResponse(
             text=result_text,
             failed_chunk_ids=failed_chunk_ids if failed_chunk_ids else None,
             text_segments=segments,
             failed_chunk_indices=failed_chunk_indices if failed_chunk_indices else None,
         )
+
     result_text = "\n\n".join(texts) if texts else ""
+    disp = (display_name or "").strip() if display_name else ""
+    if not disp and audio and len(audio) > 0:
+        disp = _sanitize_filename(audio[0])
+    transcription_history.save_transcription(
+        result_text,
+        {
+            "source": "audio",
+            "file_count": len(audio or []),
+            "language": lang,
+            "clean_up": do_clean_up,
+            "display_name": disp,
+        },
+    )
     return TranscribeResponse(
         text=result_text,
         failed_chunk_ids=failed_chunk_ids if failed_chunk_ids else None,
@@ -593,6 +638,7 @@ def _transcribe_upload_ids_to_queue(
     progress_queue: queue.Queue,
     language: str = "auto",
     clean_up: bool = True,
+    display_name_from_request: str | None = None,
 ) -> None:
     """Run transcribe loop for upload_ids; put progress before each chunk and result at end. Uses _transcribe_upload_ids_impl."""
     def on_progress(current: int, total: int, filename: str) -> None:
@@ -614,6 +660,23 @@ def _transcribe_upload_ids_to_queue(
         failed_chunks_to_cleanup, parent_dirs, failed_chunk_ids, cleanup_failed
     )
     result_text = "\n\n".join(segments) if segments else ""
+    disp = (display_name_from_request or "").strip() if display_name_from_request else ""
+    if not disp and ids:
+        first_info = get_upload(ids[0])
+        if first_info:
+            disp = _chunk_filename_to_original(first_info[1])
+    transcription_history.save_transcription(
+        result_text,
+        {
+            "source": "upload_ids_stream",
+            "upload_ids": ids,
+            "language": language,
+            "clean_up": clean_up,
+            "failed_chunk_ids": failed_chunk_ids or None,
+            "failed_chunk_indices": failed_chunk_indices or None,
+            "display_name": disp,
+        },
+    )
     progress_queue.put({
         "type": "result",
         "text": result_text,
@@ -629,8 +692,9 @@ async def transcribe_stream(
     cleanup_failed: bool = Form(False),
     language: str | None = Form(None),
     clean_up: str | None = Form(None),
+    display_name: str | None = Form(None),
 ):
-    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false)."""
+    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history)."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     if not ids:
         raise HTTPException(400, "Provide upload_ids")
@@ -642,6 +706,7 @@ async def transcribe_stream(
     progress_queue: queue.Queue = queue.Queue()
     lang = _parse_language(language)
     do_clean_up = _parse_clean_up(clean_up)
+    disp = (display_name or "").strip() or None
 
     async def ndjson_stream():
         loop = asyncio.get_running_loop()
@@ -653,6 +718,7 @@ async def transcribe_stream(
             progress_queue,
             lang,
             do_clean_up,
+            disp,
         )
         try:
             while True:
@@ -667,6 +733,36 @@ async def transcribe_stream(
                 logger.debug("Transcribe stream executor finished with exception", exc_info=True)
 
     return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+
+
+# --- Transcription history (list / get / delete) ---
+
+_LIST_PAGE_SIZE_MAX = 100
+
+
+@router.get("/transcriptions", response_model=list[TranscriptionListItem])
+async def list_transcriptions(limit: int = 50, offset: int = 0) -> list[TranscriptionListItem]:
+    """Return recent transcriptions (metadata only). Sorted by created_at desc. Pagination: limit (max 100), offset."""
+    capped = min(max(1, limit), _LIST_PAGE_SIZE_MAX)
+    off = max(0, offset)
+    items = transcription_history.list_transcriptions(limit=capped, offset=off)
+    return [TranscriptionListItem(**x) for x in items]
+
+
+@router.get("/transcriptions/{transcription_id}", response_model=TranscriptionDetail)
+async def get_transcription(transcription_id: str) -> TranscriptionDetail:
+    """Return one transcription by id (full text). 404 if not found or invalid id."""
+    data = transcription_history.get_transcription(transcription_id)
+    if data is None:
+        raise HTTPException(404, "Not found")
+    return TranscriptionDetail(**data)
+
+
+@router.delete("/transcriptions/{transcription_id}", status_code=204)
+async def delete_transcription(transcription_id: str) -> None:
+    """Delete one transcription by id. 404 if not found or invalid id."""
+    if not transcription_history.delete_transcription(transcription_id):
+        raise HTTPException(404, "Not found")
 
 
 @router.post("/translate", response_model=TranslateResponse)

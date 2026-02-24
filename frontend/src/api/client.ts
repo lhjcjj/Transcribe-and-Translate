@@ -262,9 +262,11 @@ export interface TranscribeApiResult {
   failed_chunk_indices?: number[] | null;
 }
 
+export type TranscribeEngine = "openai" | "faster_whisper";
+
 export async function transcribe(
   file: File,
-  options?: { language?: string; cleanUp?: boolean; displayName?: string; signal?: AbortSignal }
+  options?: { language?: string; cleanUp?: boolean; displayName?: string; engine?: TranscribeEngine; signal?: AbortSignal }
 ): Promise<TranscribeApiResult> {
   const form = new FormData();
   form.append("audio", file);
@@ -274,6 +276,9 @@ export async function transcribe(
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
   if (options?.displayName != null && options.displayName.trim() !== "") {
     form.append("display_name", options.displayName.trim());
+  }
+  if (options?.engine != null && options.engine !== "") {
+    form.append("engine", options.engine);
   }
   const res = await fetch(`${API_BASE}/api/transcribe`, {
     method: "POST",
@@ -292,7 +297,7 @@ export type TranscribeChunkProgress = { current: number; total: number; filename
 export async function transcribeByUploadIdsStream(
   uploadIds: string[],
   onProgress: (current: number, total: number, filename: string) => void,
-  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean; displayName?: string; signal?: AbortSignal }
+  options?: { cleanupFailed?: boolean; language?: string; cleanUp?: boolean; displayName?: string; engine?: TranscribeEngine; signal?: AbortSignal }
 ): Promise<TranscribeApiResult> {
   const form = new FormData();
   uploadIds.forEach((id) => form.append("upload_ids", id));
@@ -303,6 +308,9 @@ export async function transcribeByUploadIdsStream(
   form.append("clean_up", options?.cleanUp !== false ? "true" : "false");
   if (options?.displayName != null && options.displayName.trim() !== "") {
     form.append("display_name", options.displayName.trim());
+  }
+  if (options?.engine != null && options.engine !== "") {
+    form.append("engine", options.engine);
   }
   const res = await fetch(`${API_BASE}/api/transcribe/stream`, {
     method: "POST",

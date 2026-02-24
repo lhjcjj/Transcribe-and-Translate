@@ -9,6 +9,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   --primary-hover: #255dc8;
   --muted: #B2C9F1;
   --border: #E5EDFA;
+  /** Opaque equivalent of primary at 3% on white (for addon light state). */
+  --addon-fill-light: #F9FAFE;
   --bg-tint: rgba(42, 104, 215, 0.06);
   --bg-tint-strong: rgba(42, 104, 215, 0.12);
   --header-block-h: 120px;
@@ -131,12 +133,39 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 
 /* === Main Content === */
 .main { flex: 1; min-width: 0; padding: 2rem 2rem 2rem 0; }
+.main-title-row {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem;
+}
 .main-title {
-  margin: 0 0 1rem;
+  margin: 0;
   font-size: 36px; font-weight: 400;
   color: var(--primary);
   line-height: 1.2;
   overflow-wrap: break-word;
+}
+.engine-toggle {
+  display: flex; align-items: stretch;
+  min-width: 192px;
+  border-radius: 6px; background: #fff;
+}
+.engine-option {
+  flex: 1;
+  min-width: 0;
+  padding: 0 0.75rem; height: 34px;
+  border: none; background: #fff;
+  font-family: Verdana, sans-serif; font-size: 14px; font-weight: 400;
+  color: var(--muted);
+}
+.engine-option:first-child { border-radius: 6px 0 0 6px; }
+.engine-option:last-child { border-radius: 0 6px 6px 0; }
+.engine-option.is-active {
+  color: var(--primary); font-weight: 500; background: #fff;
+  border-radius: 6px;
+  box-shadow: 1px 1px 6px rgba(42, 104, 215, 0.36);
+  position: relative; z-index: 1;
+}
+.engine-option:hover:not(.is-active) {
+  color: var(--primary); background: #f9fafb;
 }
 .intro {
   min-height: 24px; margin: 0 0 1rem;
@@ -329,6 +358,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   flex: 1 1 auto; min-width: 0;
   border-top-left-radius: 0; border-bottom-left-radius: 0;
   color: var(--primary);
+  font-family: Verdana, sans-serif;
+  font-weight: bold;
 }
 .step-input-addon {
   flex-shrink: 0;
@@ -340,6 +371,17 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   border: 1px solid var(--border);
   white-space: nowrap;
   border-radius: 0 6px 6px 0;
+}
+/* Upload progress: 0% = all light (3% blue), 100% = all current (var(--border)). Left-to-right fill. */
+.step-input-addon.step-input-addon--progress {
+  background: linear-gradient(
+    to right,
+    var(--border) 0%,
+    var(--border) calc(var(--progress, 0) * 1%),
+    var(--addon-fill-light) calc(var(--progress, 0) * 1%),
+    var(--addon-fill-light) 100%
+  );
+  transition: background 0.15s ease-out;
 }
 
 @media (max-width: 1115px) {
@@ -398,7 +440,7 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   color: var(--primary); line-height: 1.4;
   border: 1px solid var(--border);
   border-radius: 6px 6px 0 0;
-  background: rgba(42, 104, 215, 0.03);
+  background: var(--addon-fill-light);
   display: flex; align-items: flex-start; z-index: 0;
 }
 .step:first-child .step-desc, .step:nth-child(5) .step-desc { visibility: hidden; }

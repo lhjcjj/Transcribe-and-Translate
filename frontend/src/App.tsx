@@ -12,6 +12,7 @@ import {
   transcribeByUploadIdsStream,
   upload,
   TranscribeApiResult,
+  TranscribeEngine,
   TranscriptionListItem,
 } from "./api/client";
 import { FileUpload } from "./components/FileUpload";
@@ -135,6 +136,7 @@ export default function App() {
   const uploadGenerationRef = useRef(0);
   const downloadRevokeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [maxUploadBytes, setMaxUploadBytes] = useState<number | null>(null);
+  const [transcribeEngine, setTranscribeEngine] = useState<TranscribeEngine>("faster_whisper");
 
   // If this component ever calls translate(), pass apiAbortRef.current?.signal so the request is aborted on unmount.
   useEffect(() => {
@@ -238,10 +240,6 @@ export default function App() {
     clearUploadState
   );
 
-  useEffect(() => {
-    if (!isSplitting) setIsCancellingSplit(false);
-  }, [isSplitting]);
-
   const hasFile = useMemo(() => Boolean(uploadFileName), [uploadFileName]);
   const isUploaded = useMemo(() => Boolean(uploadId), [uploadId]);
   const hasChunks = useMemo(
@@ -268,9 +266,10 @@ export default function App() {
       isUploading ||
       isDeletingUpload ||
       isSplitting ||
+      isCancellingSplit ||
       isTranscribing ||
       (isUploaded && uploadDurationSeconds == null),
-    [isUploading, isDeletingUpload, isSplitting, isTranscribing, isUploaded, uploadDurationSeconds]
+    [isUploading, isDeletingUpload, isSplitting, isCancellingSplit, isTranscribing, isUploaded, uploadDurationSeconds]
   );
   const splitStepDisabled = useMemo(
     () =>
@@ -291,6 +290,15 @@ export default function App() {
         : null,
     [uploadDurationSeconds, chunkSizeMin]
   );
+  /** Progress 0–100 for chunks addon fill (1/6 → ~16.67, 2/6 → ~33.33, …). null = no fill. */
+  const chunksAddonProgress = useMemo((): number | null => {
+    if (isSplitting && splitProgress && splitProgress.total > 0) {
+      return (splitProgress.current / splitProgress.total) * 100;
+    }
+    if (hasChunks && splitChunkIds?.length) return 100;
+    if (segmentCount != null) return 0;
+    return null;
+  }, [isSplitting, splitProgress, hasChunks, splitChunkIds, segmentCount]);
   const fileSizeAddonSuffix = useMemo(
     () =>
       selectedFile == null
@@ -388,12 +396,24 @@ export default function App() {
         }
       } else if (type === "split") {
         setIsCancellingSplit(true);
-        cancelSplitStream({ signal: apiAbortRef.current?.signal ?? undefined }).catch((err) => {
+        const minDelDisplayMs = 400;
+        const startAt = Date.now();
+        try {
+          await cancelSplitStream({ signal: apiAbortRef.current?.signal ?? undefined });
+        } catch (err) {
           console.error("Cancel split request failed");
-          if (import.meta.env.DEV && err) console.error(err); // dev only; production does not expose stack
-        });
-        splitAbortRef.current?.abort();
-        clearUploadState();
+          if (import.meta.env.DEV && err) console.error(err);
+        } finally {
+          splitAbortRef.current?.abort();
+          clearUploadState();
+          const elapsed = Date.now() - startAt;
+          const delay = Math.max(0, minDelDisplayMs - elapsed);
+          if (delay > 0) {
+            setTimeout(() => setIsCancellingSplit(false), delay);
+          } else {
+            setIsCancellingSplit(false);
+          }
+        }
       }
     },
     [confirmCancelType, uploadId, deleteUploadAndClearUploadState, clearFileSelection, clearUploadState]
@@ -408,20 +428,23 @@ export default function App() {
       if (!selectedFile) return;
       uploadGenerationRef.current += 1;
       const uploadGeneration = uploadGenerationRef.current;
-      await deleteUploadIds(failedChunkIds, apiAbortRef.current?.signal ?? undefined);
-      setFailedChunkIds(null);
-      setFailedChunkIndices(null);
-      setTranscribeSegments(null);
       const controller = new AbortController();
       uploadAbortRef.current = controller;
       setIsUploading(true);
       setUploadProgress(0);
       try {
+        await deleteUploadIds(splitChunkIds, controller.signal);
+        await deleteUploadIds(failedChunkIds, controller.signal);
+        setSplitChunkIds(null);
+        setFailedChunkIds(null);
+        setFailedChunkIndices(null);
+        setTranscribeSegments(null);
         const res = await upload(selectedFile, {
           signal: controller.signal,
           onProgress: (p) => setUploadProgress(p.percent),
         });
         setUploadId(res.upload_id);
+        setIsCancellingSplit(false);
         if (res.duration_seconds != null) {
           setUploadDurationSeconds(res.duration_seconds);
           setUploadProgress(100);
@@ -474,7 +497,7 @@ export default function App() {
         uploadAbortRef.current = null;
       }
     },
-    [isUploading, selectedFile, failedChunkIds]
+    [isUploading, selectedFile, splitChunkIds, failedChunkIds]
   );
 
   const handleSplit = useCallback(() => {
@@ -499,10 +522,12 @@ export default function App() {
       const controller = new AbortController();
       transcribeAbortRef.current = controller;
       setIsTranscribing(true);
+      let wasChunked = false;
       try {
         const chunkIds = splitChunkIds ?? [];
         const file = selectedFile;
         if (!hasChunks && !file) throw new Error("No file");
+        wasChunked = hasChunks;
         let result: TranscribeApiResult;
         if (hasChunks) {
           result = await transcribeByUploadIdsStream(
@@ -513,6 +538,7 @@ export default function App() {
               language: langOption,
               cleanUp: cleanOption === "yes",
               displayName: uploadFileName,
+              engine: transcribeEngine,
               signal: controller.signal,
             }
           );
@@ -522,10 +548,14 @@ export default function App() {
             language: langOption,
             cleanUp: cleanOption === "yes",
             displayName: file.name,
+            engine: transcribeEngine,
             signal: controller.signal,
           });
         }
         setTranscribeText(result.text);
+        if (hasChunks) {
+          setTranscribeChunkProgress((prev) => (prev ? { ...prev, current: prev.total } : null));
+        }
         if (result.failed_chunk_ids?.length && result.text_segments && result.failed_chunk_indices?.length) {
           setTranscribeSegments(result.text_segments);
           setFailedChunkIds(result.failed_chunk_ids);
@@ -543,7 +573,7 @@ export default function App() {
       } finally {
         transcribeAbortRef.current = null;
         setIsTranscribing(false);
-        setTranscribeChunkProgress(null);
+        if (!wasChunked) setTranscribeChunkProgress(null);
       }
     },
     [
@@ -556,6 +586,7 @@ export default function App() {
       uploadFileName,
       langOption,
       cleanOption,
+      transcribeEngine,
       deleteUploadAndClearUploadState,
     ]
   );
@@ -678,6 +709,7 @@ export default function App() {
             language: langOption,
             cleanUp: cleanOption === "yes",
             displayName: uploadFileName,
+            engine: transcribeEngine,
             signal: controller.signal,
           }
         );
@@ -702,7 +734,6 @@ export default function App() {
       } finally {
         transcribeAbortRef.current = null;
         setIsTranscribing(false);
-        setTranscribeChunkProgress(null);
       }
     },
     [
@@ -712,6 +743,7 @@ export default function App() {
       isTranscribing,
       langOption,
       cleanOption,
+      transcribeEngine,
     ]
   );
 
@@ -720,9 +752,39 @@ export default function App() {
       transcribeChunkProgress != null
         ? transcribeChunkProgress.filename
         : isTranscribing
-          ? "Transcribing…"
-          : "Task information",
-    [transcribeChunkProgress, isTranscribing]
+          ? uploadFileName || "Transcribing…"
+          : transcribeText != null
+            ? (uploadFileName || transcribeChunkProgress?.filename || "Task information")
+            : "Task information",
+    [transcribeChunkProgress, isTranscribing, uploadFileName, transcribeText]
+  );
+
+  /** Chunks: backend sends (current_1based, total) before each chunk; we show completed/total (0→total). Single file: 0/1 then 1/1. */
+  const transcribeAddonCompleted = useMemo((): { completed: number; total: number } | null => {
+    if (transcribeChunkProgress && transcribeChunkProgress.total > 0) {
+      const { current, total } = transcribeChunkProgress;
+      const completed = current === total && transcribeText != null ? total : Math.max(0, current - 1);
+      return { completed, total };
+    }
+    if (isTranscribing && hasChunks && splitChunkIds?.length) return { completed: 0, total: splitChunkIds.length };
+    if (isTranscribing && !hasChunks) return { completed: 0, total: 1 };
+    if (!isTranscribing && transcribeText != null && !hasChunks) return { completed: 1, total: 1 };
+    return null;
+  }, [transcribeChunkProgress, isTranscribing, hasChunks, splitChunkIds, transcribeText]);
+
+  /** Progress 0–100 for transcribe addon fill. null = no fill. */
+  const transcribeAddonProgress = useMemo((): number | null => {
+    const c = transcribeAddonCompleted;
+    if (c && c.total > 0) return (c.completed / c.total) * 100;
+    return null;
+  }, [transcribeAddonCompleted]);
+
+  const transcribeAddonText = useMemo(
+    () =>
+      transcribeAddonCompleted
+        ? `${transcribeAddonCompleted.completed}/${transcribeAddonCompleted.total} chunks`
+        : "chunks",
+    [transcribeAddonCompleted]
   );
 
   const uploadButtonText = useMemo(
@@ -745,7 +807,7 @@ export default function App() {
           <span className="brand-name">LHJCJJ.Tools</span>
           <a href="#" className="btn-signup">sign up</a>
           <a href="#" className="btn-login">log in</a>
-          <p className="notice">
+          <p className="notice" title="Notices: 2026.02.23 Release Transcribe and Translate Tool v1.0.3">
             Notices: 2026.02.23 Release Transcribe and Translate Tool v1.0.3
           </p>
         </header>
@@ -757,11 +819,29 @@ export default function App() {
           </nav>
 
           <main className="main">
-            <h1 className="main-title">Transcribe and Translate</h1>
+            <div className="main-title-row">
+              <h1 className="main-title">Transcribe and Translate</h1>
+              <div className="engine-toggle" role="group" aria-label="Transcription engine">
+                <button
+                  type="button"
+                  className={`engine-option ${transcribeEngine === "faster_whisper" ? "is-active" : ""}`}
+                  onClick={() => setTranscribeEngine("faster_whisper")}
+                >
+                  Local
+                </button>
+                <button
+                  type="button"
+                  className={`engine-option ${transcribeEngine === "openai" ? "is-active" : ""}`}
+                  onClick={() => setTranscribeEngine("openai")}
+                >
+                  OpenAI
+                </button>
+              </div>
+            </div>
 
             <div className="intro">
               <span className="intro-label">Introduction: </span>
-              <span className="intro-placeholder">Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt</span>
+              <span className="intro-placeholder" title="Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt">Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt</span>
             </div>
 
             <div className="steps">
@@ -774,9 +854,11 @@ export default function App() {
                 onFileChange={handleFileChange}
                 onClear={handleClear}
                 onBrowse={handleBrowse}
-                uploadButtonDisabled={!hasFile || isUploaded || fileTooBig || isDeletingUpload || hasChunks}
+                uploadButtonDisabled={!hasFile || fileTooBig || isDeletingUpload || isCancellingSplit || isUploaded || (isTranscribing && hasChunks)}
                 uploadButtonText={uploadButtonText}
                 onUploadOrCancel={handleUploadOrCancel}
+                uploadProgress={uploadProgress}
+                isUploading={isUploading}
               />
 
               <section className="step">
@@ -802,7 +884,10 @@ export default function App() {
                           onBlur={() => setChunkSizeInput(String(chunkSizeMin))}
                         />
                         <span className="step-input-suffix"> mins</span>
-                        <span className="step-input-addon">
+                        <span
+                          className={`step-input-addon${chunksAddonProgress != null ? " step-input-addon--progress" : ""}`}
+                          style={chunksAddonProgress != null ? ({ "--progress": chunksAddonProgress } as React.CSSProperties) : undefined}
+                        >
                           {isSplitting && splitProgress
                             ? `${splitProgress.current}/${splitProgress.current === 0 && segmentCount != null ? segmentCount : splitProgress.total} chunks`
                             : hasChunks && splitChunkIds
@@ -864,13 +949,19 @@ export default function App() {
                     <div className="step-wrap">
                       <p className="step-desc">default</p>
                       <div className="step-inner">
-                        <div role="log" className={`step-log${stepLogText === "Task information" ? " step-log-default" : ""}`}><span className="step-log-text">{stepLogText}</span></div>
+                        <div role="log" className={`step-log${stepLogText === "Task information" ? " step-log-default" : ""}`} title={stepLogText !== "Task information" ? stepLogText : undefined}><span className="step-log-text">{stepLogText}</span></div>
+                        <span
+                          className={`step-input-addon${transcribeAddonProgress != null ? " step-input-addon--progress" : ""}`}
+                          style={transcribeAddonProgress != null ? ({ "--progress": transcribeAddonProgress } as React.CSSProperties) : undefined}
+                        >
+                          {transcribeAddonText}
+                        </span>
                       </div>
                     </div>
                     <button
                       type="button"
                       className="step-transcribe-transcribe"
-                      disabled={isTranscribing || isDeletingUpload || (!failedChunkIds?.length && !canTranscribe)}
+                      disabled={isTranscribing || isDeletingUpload || isUploading || isSplitting || (!failedChunkIds?.length && !canTranscribe)}
                       onClick={failedChunkIds?.length ? handleRetryFailedChunks : handleTranscribe}
                     >
                       {isTranscribing ? "transcribing…" : failedChunkIds?.length ? "retry failed" : "transcribe"}
@@ -896,7 +987,7 @@ export default function App() {
                     <>
                       {historyItems.map((item) => (
                         <li key={item.id} className="history-item">
-                          <span className="history-item-name">{item.display_name}</span>
+                          <span className="history-item-name" title={item.display_name}>{item.display_name}</span>
                           <span className="history-item-time">{formatCreatedAt(item.created_at)}</span>
                           <span className="history-item-actions">
                             <button type="button" className="history-item-download" onClick={() => { setPendingHistoryDownload(item); setShowDownloadDialog(true); }}>download</button>

@@ -12,6 +12,9 @@ export interface FileUploadProps {
   uploadButtonDisabled: boolean;
   uploadButtonText: string;
   onUploadOrCancel: () => void;
+  /** When set during upload, addon shows progress fill (0–100). */
+  uploadProgress?: number | null;
+  isUploading?: boolean;
 }
 
 export function FileUpload({
@@ -26,7 +29,10 @@ export function FileUpload({
   uploadButtonDisabled,
   uploadButtonText,
   onUploadOrCancel,
+  uploadProgress = null,
+  isUploading = false,
 }: FileUploadProps) {
+  const showProgress = isUploading && uploadProgress != null;
   return (
     <section className="step">
       <div className="step-head">
@@ -55,6 +61,7 @@ export function FileUpload({
                 value={fileName}
                 disabled={disabled}
                 aria-label="Selected audio file name"
+                title={fileName || undefined}
               />
               {hasFile && !disabled ? (
                 <button
@@ -66,7 +73,12 @@ export function FileUpload({
                   ×
                 </button>
               ) : null}
-              <span className="step-input-addon">{fileSizeAddon}</span>
+              <span
+                className={`step-input-addon${showProgress ? " step-input-addon--progress" : ""}`}
+                style={showProgress ? ({ "--progress": uploadProgress } as React.CSSProperties) : undefined}
+              >
+                {fileSizeAddon}
+              </span>
             </div>
           </div>
           <button

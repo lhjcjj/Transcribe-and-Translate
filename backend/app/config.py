@@ -1,5 +1,11 @@
 """Load configuration from environment variables. No secret defaults."""
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load backend/.env so project-only vars (e.g. TRANSCRIBE_ENGINE) can be set without system env
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def _str_list(value: str | None) -> list[str]:
@@ -47,6 +53,12 @@ TRANSCRIBE_MAX_BATCH_SIZE = max(1, int(os.environ.get("TRANSCRIBE_MAX_BATCH_SIZE
 
 # Max retries for transcription API on connection errors.
 TRANSCRIBE_MAX_RETRIES = max(1, int(os.environ.get("TRANSCRIBE_MAX_RETRIES", "3")))
+
+# Transcription engine: "openai" (Whisper API) or "faster_whisper" (local).
+TRANSCRIBE_ENGINE = (os.environ.get("TRANSCRIBE_ENGINE") or "faster_whisper").strip().lower()
+# faster_whisper only: model name (e.g. base, small, medium) and device (cpu, cuda, etc.).
+FASTER_WHISPER_MODEL = (os.environ.get("FASTER_WHISPER_MODEL") or "base").strip().lower()
+FASTER_WHISPER_DEVICE = (os.environ.get("FASTER_WHISPER_DEVICE") or "cpu").strip().lower()
 
 # Optional API key for /api: when set, every request must send X-API-Key or Authorization: Bearer <key>. Leave empty for no auth (e.g. local only).
 API_KEY = (os.environ.get("API_KEY") or os.environ.get("BACKEND_API_KEY") or "").strip()

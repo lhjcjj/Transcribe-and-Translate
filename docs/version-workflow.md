@@ -24,7 +24,7 @@ chmod +x scripts/sync-version.sh   # 首次需要
 
 1. **改版本号**：编辑 `VERSION`，例如 `1.0.1` → `1.0.2`
 2. **同步**：`./scripts/sync-version.sh`
-3. **查看修改**：`git add -A`
+3. **查看修改**：`git status`
 4. **提交所有并 push**：
    ```bash
    git add -A

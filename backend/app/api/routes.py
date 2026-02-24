@@ -402,6 +402,7 @@ def _transcribe_upload_ids_impl(
     language: str,
     clean_up: bool,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    engine: str | None = None,
 ) -> tuple[list[str], list[str], list[int], set[Path], list[tuple[str, str]]]:
     """Shared transcribe loop for upload_ids. Optionally call progress_callback(current_1based, total, filename) before each chunk. Returns (segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup). May raise StoreFullError."""
     segments: list[str] = [""] * len(ids)
@@ -443,7 +444,7 @@ def _transcribe_upload_ids_impl(
             continue
         try:
             segment_text = transcribe_svc.transcribe_audio(
-                chunk_bytes, chunk_filename, language=language, clean_up=clean_up
+                chunk_bytes, chunk_filename, language=language, clean_up=clean_up, engine=engine
             )
             segments[i] = segment_text
             try:
@@ -496,9 +497,10 @@ def _transcribe_upload_ids_sync(
     cleanup_failed: bool,
     language: str,
     clean_up: bool,
+    engine: str | None = None,
 ) -> tuple[list[str], list[str], list[int], set[Path], list[tuple[str, str]]]:
     """Run transcribe loop for upload_ids in a thread. Returns (segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup)."""
-    return _transcribe_upload_ids_impl(ids, cleanup_failed, language, clean_up, progress_callback=None)
+    return _transcribe_upload_ids_impl(ids, cleanup_failed, language, clean_up, progress_callback=None, engine=engine)
 
 
 @router.post("/transcribe", response_model=TranscribeResponse)
@@ -509,8 +511,9 @@ async def transcribe(
     language: str | None = Form(None),
     clean_up: str | None = Form(None),
     display_name: str | None = Form(None),
+    engine: str | None = Form(None),
 ) -> TranscribeResponse:
-    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
+    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (openai | faster_whisper). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     has_upload_ids = len(ids) > 0
     has_files = audio and len(audio) > 0
@@ -548,6 +551,7 @@ async def transcribe(
                 cleanup_failed,
                 lang,
                 do_clean_up,
+                (engine.strip() if engine and engine.strip() else None),
             )
         except StoreFullError:
             raise HTTPException(503, "Upload store full. Try again later.")
@@ -557,6 +561,8 @@ async def transcribe(
     else:
         # Direct audio upload: transcribe one or more files in executor threads.
         loop = asyncio.get_running_loop()
+
+        engine_param = engine.strip() if engine and engine.strip() else None
 
         async def transcribe_one_file(f: UploadFile) -> str:
             if not allowed_audio_content_type(f.content_type):
@@ -571,8 +577,8 @@ async def transcribe(
             try:
                 return await loop.run_in_executor(
                     None,
-                    lambda b=body, n=name: transcribe_svc.transcribe_audio(
-                        b, n, language=lang, clean_up=do_clean_up
+                    lambda b=body, n=name, e=engine_param: transcribe_svc.transcribe_audio(
+                        b, n, language=lang, clean_up=do_clean_up, engine=e
                     ),
                 )
             except ValueError:
@@ -639,6 +645,7 @@ def _transcribe_upload_ids_to_queue(
     language: str = "auto",
     clean_up: bool = True,
     display_name_from_request: str | None = None,
+    engine: str | None = None,
 ) -> None:
     """Run transcribe loop for upload_ids; put progress before each chunk and result at end. Uses _transcribe_upload_ids_impl."""
     def on_progress(current: int, total: int, filename: str) -> None:
@@ -646,7 +653,7 @@ def _transcribe_upload_ids_to_queue(
 
     try:
         segments, failed_chunk_ids, failed_chunk_indices, parent_dirs, failed_chunks_to_cleanup = _transcribe_upload_ids_impl(
-            ids, cleanup_failed, language, clean_up, progress_callback=on_progress
+            ids, cleanup_failed, language, clean_up, progress_callback=on_progress, engine=engine
         )
     except StoreFullError:
         progress_queue.put({"type": "error", "detail": "Upload store full. Try again later."})
@@ -693,8 +700,9 @@ async def transcribe_stream(
     language: str | None = Form(None),
     clean_up: str | None = Form(None),
     display_name: str | None = Form(None),
+    engine: str | None = Form(None),
 ):
-    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history)."""
+    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (openai | faster_whisper)."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     if not ids:
         raise HTTPException(400, "Provide upload_ids")
@@ -707,6 +715,7 @@ async def transcribe_stream(
     lang = _parse_language(language)
     do_clean_up = _parse_clean_up(clean_up)
     disp = (display_name or "").strip() or None
+    engine_param = engine.strip() if engine and engine.strip() else None
 
     async def ndjson_stream():
         loop = asyncio.get_running_loop()
@@ -719,6 +728,7 @@ async def transcribe_stream(
             lang,
             do_clean_up,
             disp,
+            engine_param,
         )
         try:
             while True:

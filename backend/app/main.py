@@ -46,7 +46,7 @@ async def _cleanup_loop(stop: asyncio.Event) -> None:
 app = FastAPI(
     title="Transcribe and Translate",
     description="Audio transcription and text translation API",
-    version="1.0.4",
+    version="1.0.5",
     lifespan=lifespan,
 )
 

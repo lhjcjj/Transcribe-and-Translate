@@ -34,12 +34,33 @@ from app.api.upload_store import (
     upload_semaphore,
 )
 from app.schemas.transcribe import TranscribeResponse
+from app.schemas.summarize import SummarizeRequest, SummarizeResponse
 from app.schemas.transcription_history import TranscriptionDetail, TranscriptionListItem
-from app.api import transcription_history
+from app.schemas.translation_history import (
+    TranslationDetail,
+    TranslationListItem,
+    TranslationSaveRequest,
+    TranslationSaveResponse,
+)
+from app.schemas.summary_history import (
+    SummaryDetail,
+    SummaryListItem,
+    SummarySaveRequest,
+    SummarySaveResponse,
+)
+from app.schemas.article_history import (
+    ArticleDetail,
+    ArticleListItem,
+    ArticleSaveRequest,
+    ArticleSaveResponse,
+)
+from app.api import transcription_history, translation_history, summary_history, article_history
 from app.schemas.translate import TranslateRequest, TranslateResponse
 from app.services import audio_split as audio_split_svc
 from app.services import transcribe as transcribe_svc
 from app.services import translate as translate_svc
+from app.services import summarize as summarize_svc
+from app.services import summarize_qwen as summarize_qwen_svc
 
 
 class SplitCancelled(Exception):
@@ -513,7 +534,7 @@ async def transcribe(
     display_name: str | None = Form(None),
     engine: str | None = Form(None),
 ) -> TranscribeResponse:
-    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (openai | faster_whisper). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
+    """Transcribe to text: provide upload_ids (list of chunk upload_ids from split) or one or more audio files (multipart 'audio'). Exactly one of upload_ids / audio required. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (api | faster_whisper). If cleanup_failed=True, failed chunks are deleted (abandon retry); if False (default), failed chunks are kept for manual retry."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     has_upload_ids = len(ids) > 0
     has_files = audio and len(audio) > 0
@@ -600,6 +621,7 @@ async def transcribe(
             if first_info:
                 disp = _chunk_filename_to_original(first_info[1])
         transcription_history.save_transcription(
+            disp,
             result_text,
             {
                 "source": "upload_ids",
@@ -608,7 +630,6 @@ async def transcribe(
                 "clean_up": do_clean_up,
                 "failed_chunk_ids": failed_chunk_ids or None,
                 "failed_chunk_indices": failed_chunk_indices or None,
-                "display_name": disp,
             },
         )
         return TranscribeResponse(
@@ -623,13 +644,13 @@ async def transcribe(
     if not disp and audio and len(audio) > 0:
         disp = _sanitize_filename(audio[0])
     transcription_history.save_transcription(
+        disp,
         result_text,
         {
             "source": "audio",
             "file_count": len(audio or []),
             "language": lang,
             "clean_up": do_clean_up,
-            "display_name": disp,
         },
     )
     return TranscribeResponse(
@@ -673,6 +694,7 @@ def _transcribe_upload_ids_to_queue(
         if first_info:
             disp = _chunk_filename_to_original(first_info[1])
     transcription_history.save_transcription(
+        disp,
         result_text,
         {
             "source": "upload_ids_stream",
@@ -681,7 +703,6 @@ def _transcribe_upload_ids_to_queue(
             "clean_up": clean_up,
             "failed_chunk_ids": failed_chunk_ids or None,
             "failed_chunk_indices": failed_chunk_indices or None,
-            "display_name": disp,
         },
     )
     progress_queue.put({
@@ -702,7 +723,7 @@ async def transcribe_stream(
     display_name: str | None = Form(None),
     engine: str | None = Form(None),
 ):
-    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (openai | faster_whisper)."""
+    """Stream transcribe progress (NDJSON): progress events with current/total/filename, then result. upload_ids only. Optional: language (auto/en/zh), clean_up (true/false), display_name (original filename for history), engine (api | faster_whisper)."""
     ids = [x.strip() for x in (upload_ids or []) if x and x.strip()]
     if not ids:
         raise HTTPException(400, "Provide upload_ids")
@@ -775,6 +796,120 @@ async def delete_transcription(transcription_id: str) -> None:
         raise HTTPException(404, "Not found")
 
 
+# --- Translation history (save / list / get / delete) ---
+
+
+@router.post("/translations", response_model=TranslationSaveResponse)
+async def save_translation(req: TranslationSaveRequest) -> TranslationSaveResponse:
+    """Save a translation to history. Returns id and metadata (no full text)."""
+    translation_id = translation_history.save_translation(req.display_name, req.text)
+    data = translation_history.get_translation(translation_id)
+    if not data:
+        return TranslationSaveResponse(id=translation_id, created_at=None, display_name=req.display_name)
+    return TranslationSaveResponse(id=data["id"], created_at=data.get("created_at"), display_name=data["display_name"])
+
+
+@router.get("/translations", response_model=list[TranslationListItem])
+async def list_translations(limit: int = 50, offset: int = 0) -> list[TranslationListItem]:
+    """Return recent translations (metadata only). Sorted by created_at desc. Pagination: limit (max 100), offset."""
+    capped = min(max(1, limit), _LIST_PAGE_SIZE_MAX)
+    off = max(0, offset)
+    items = translation_history.list_translations(limit=capped, offset=off)
+    return [TranslationListItem(**x) for x in items]
+
+
+@router.get("/translations/{translation_id}", response_model=TranslationDetail)
+async def get_translation(translation_id: str) -> TranslationDetail:
+    """Return one translation by id (full text). 404 if not found or invalid id."""
+    data = translation_history.get_translation(translation_id)
+    if data is None:
+        raise HTTPException(404, "Not found")
+    return TranslationDetail(**data)
+
+
+@router.delete("/translations/{translation_id}", status_code=204)
+async def delete_translation(translation_id: str) -> None:
+    """Delete one translation by id. 404 if not found or invalid id."""
+    if not translation_history.delete_translation(translation_id):
+        raise HTTPException(404, "Not found")
+
+
+# --- Summary history (save / list / get / delete) ---
+
+
+@router.post("/summaries", response_model=SummarySaveResponse)
+async def save_summary(req: SummarySaveRequest) -> SummarySaveResponse:
+    """Save a summary to history. Returns id and metadata (no full text)."""
+    summary_id = summary_history.save_summary(req.display_name, req.text)
+    data = summary_history.get_summary(summary_id)
+    if not data:
+        return SummarySaveResponse(id=summary_id, created_at=None, display_name=req.display_name)
+    return SummarySaveResponse(id=data["id"], created_at=data.get("created_at"), display_name=data["display_name"])
+
+
+@router.get("/summaries", response_model=list[SummaryListItem])
+async def list_summaries(limit: int = 50, offset: int = 0) -> list[SummaryListItem]:
+    """Return recent summaries (metadata only). Sorted by created_at desc. Pagination: limit (max 100), offset."""
+    capped = min(max(1, limit), _LIST_PAGE_SIZE_MAX)
+    off = max(0, offset)
+    items = summary_history.list_summaries(limit=capped, offset=off)
+    return [SummaryListItem(**x) for x in items]
+
+
+@router.get("/summaries/{summary_id}", response_model=SummaryDetail)
+async def get_summary(summary_id: str) -> SummaryDetail:
+    """Return one summary by id (full text). 404 if not found or invalid id."""
+    data = summary_history.get_summary(summary_id)
+    if data is None:
+        raise HTTPException(404, "Not found")
+    return SummaryDetail(**data)
+
+
+@router.delete("/summaries/{summary_id}", status_code=204)
+async def delete_summary(summary_id: str) -> None:
+    """Delete one summary by id. 404 if not found or invalid id."""
+    if not summary_history.delete_summary(summary_id):
+        raise HTTPException(404, "Not found")
+
+
+# --- Restructured articles history (save / list / get / delete) ---
+
+
+@router.post("/articles", response_model=ArticleSaveResponse)
+async def save_article(req: ArticleSaveRequest) -> ArticleSaveResponse:
+    """Save a restructured article to history. Returns id and metadata (no full text)."""
+    article_id = article_history.save_article(req.display_name, req.text)
+    data = article_history.get_article(article_id)
+    if not data:
+        return ArticleSaveResponse(id=article_id, created_at=None, display_name=req.display_name)
+    return ArticleSaveResponse(id=data["id"], created_at=data.get("created_at"), display_name=data["display_name"])
+
+
+@router.get("/articles", response_model=list[ArticleListItem])
+async def list_articles(limit: int = 50, offset: int = 0) -> list[ArticleListItem]:
+    """Return recent restructured articles (metadata only). Sorted by created_at desc. Pagination: limit (max 100), offset."""
+    capped = min(max(1, limit), _LIST_PAGE_SIZE_MAX)
+    off = max(0, offset)
+    items = article_history.list_articles(limit=capped, offset=off)
+    return [ArticleListItem(**x) for x in items]
+
+
+@router.get("/articles/{article_id}", response_model=ArticleDetail)
+async def get_article(article_id: str) -> ArticleDetail:
+    """Return one restructured article by id (full text). 404 if not found or invalid id."""
+    data = article_history.get_article(article_id)
+    if data is None:
+        raise HTTPException(404, "Not found")
+    return ArticleDetail(**data)
+
+
+@router.delete("/articles/{article_id}", status_code=204)
+async def delete_article(article_id: str) -> None:
+    """Delete one restructured article by id. 404 if not found or invalid id."""
+    if not article_history.delete_article(article_id):
+        raise HTTPException(404, "Not found")
+
+
 @router.post("/translate", response_model=TranslateResponse)
 async def translate(req: TranslateRequest) -> TranslateResponse:
     """Translate text to target language."""
@@ -782,11 +917,31 @@ async def translate(req: TranslateRequest) -> TranslateResponse:
         raise HTTPException(400, "Invalid target_lang")
 
     try:
-        text = translate_svc.translate_text(req.text, req.target_lang)
-    except ValueError:
+        text = translate_svc.translate_text(req.text, req.target_lang, engine=req.engine)
+    except ValueError as e:
+        logger.warning("Translation configuration/local error: %s", e)
         raise HTTPException(503, "Translation service unavailable")
     except Exception:
-        logger.debug("Translation exception", exc_info=True)
+        logger.exception("Translation request failed")
         raise HTTPException(502, "Translation request failed")
 
     return TranslateResponse(text=text)
+
+
+@router.post("/summarize", response_model=SummarizeResponse)
+async def summarize(req: SummarizeRequest) -> SummarizeResponse:
+    """Summarize text using remote API (OpenAI) or local Qwen, depending on engine."""
+    engine = (req.engine or "api").strip().lower()
+    try:
+        if engine == "local":
+            text = summarize_qwen_svc.summarize_qwen(req.text)
+        else:
+            text = summarize_svc.summarize_text(req.text)
+    except ValueError as e:
+        logger.warning("Summary configuration/local error: %s", e)
+        raise HTTPException(503, "Summary service unavailable")
+    except Exception:
+        logger.exception("Summary request failed")
+        raise HTTPException(502, "Summary request failed")
+
+    return SummarizeResponse(text=text)

@@ -19,7 +19,7 @@ _lock = threading.RLock()
 
 # History directory lives alongside the backend code by default. Fixed path so
 # history survives process restarts.
-_HISTORY_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "transcriptions"
+_HISTORY_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "transcripts"
 _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # Soft cap to avoid unbounded growth. When exceeded, oldest entries are removed.
@@ -64,10 +64,31 @@ def _prune_if_needed() -> None:
             continue
 
 
-def save_transcription(text: str, meta: Mapping[str, Any] | None = None) -> str:
+_AUDIO_EXT_RE = re.compile(r"\.(mp3|wav|m4a|flac|ogg|webm|mp4|aac|opus|wma)$", re.IGNORECASE)
+_TRAILING_SUFFIX_RE = re.compile(r"\((raw|trans|sum|sum-transcript|sum-translation|art)\)$", re.IGNORECASE)
+
+
+def _normalize_transcription_name(display_name: str, transcription_id: str) -> str:
+    """Strip audio extensions and existing (...) suffixes, then add exactly one (raw)."""
+    name = (display_name or "").strip()
+    if not name:
+        name = f"Transcription {transcription_id[:8]}"
+    # Strip audio extension at end, e.g. .mp3
+    name = _AUDIO_EXT_RE.sub("", name)
+    # Strip any existing known suffix in parentheses at end, e.g. (raw)
+    name = _TRAILING_SUFFIX_RE.sub("", name).rstrip()
+    return f"{name}(raw)"
+
+
+def save_transcription(
+    display_name: str,
+    text: str,
+    meta: Mapping[str, Any] | None = None,
+) -> str:
     """Persist one completed transcription to disk.
 
     Args:
+        display_name: User-facing name for this transcription (e.g. filename).
         text: Full transcription text (possibly partial if some chunks failed).
         meta: Optional metadata for future history features
               (e.g. {'source': 'upload_ids', 'upload_ids': [...]}).
@@ -77,9 +98,11 @@ def save_transcription(text: str, meta: Mapping[str, Any] | None = None) -> str:
     """
 
     transcription_id = str(uuid.uuid4())
+    clean_name = _normalize_transcription_name(display_name, transcription_id)
     payload: dict[str, Any] = {
         "id": transcription_id,
         "created_at": time.time(),
+        "display_name": clean_name,
         "text": text,
     }
     if meta:
@@ -127,15 +150,19 @@ def list_transcriptions(limit: int = 50, offset: int = 0) -> list[dict[str, Any]
             continue
         tid = data.get("id") or p.stem
         created_at = data.get("created_at")
-        meta = data.get("meta")
-        display_name = ""
-        if isinstance(meta, dict) and meta.get("display_name"):
-            display_name = str(meta["display_name"]).strip()
-        out.append({
-            "id": tid,
-            "created_at": created_at,
-            "display_name": display_name or f"Transcription {tid[:8]}",
-        })
+        display_name = (data.get("display_name") or "").strip()
+        # Backward compatibility: older entries may only have display_name in meta.
+        if not display_name:
+            meta = data.get("meta")
+            if isinstance(meta, dict) and meta.get("display_name"):
+                display_name = str(meta["display_name"]).strip()
+        out.append(
+            {
+                "id": tid,
+                "created_at": created_at,
+                "display_name": display_name or f"Transcription {tid[:8]}",
+            }
+        )
     return out
 
 
@@ -157,9 +184,19 @@ def get_transcription(transcription_id: str) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict) or "text" not in data:
         return None
+    # Derive display_name similarly to list_transcriptions for consistency.
+    tid = data.get("id", transcription_id)
+    display_name = (data.get("display_name") or "").strip()
+    if not display_name:
+        meta = data.get("meta")
+        if isinstance(meta, dict) and meta.get("display_name"):
+            display_name = str(meta["display_name"]).strip()
+    if not display_name:
+        display_name = f"Transcription {str(tid)[:8]}"
     return {
-        "id": data.get("id", transcription_id),
+        "id": tid,
         "created_at": data.get("created_at"),
+        "display_name": display_name,
         "text": data.get("text", ""),
         "meta": data.get("meta"),
     }

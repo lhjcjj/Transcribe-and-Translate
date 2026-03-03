@@ -1,5 +1,9 @@
 """FastAPI application entrypoint."""
 import asyncio
+import os
+import signal
+import threading
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,9 +18,46 @@ from app.api.upload_store import (
 from app.api.routes import router
 from app.config import ALLOWED_ORIGINS, CLEANUP_INTERVAL_SECONDS
 
+# Grace period (seconds) before force exit when receiving SIGTERM/SIGINT.
+# Prevents hang when non-daemon threads (e.g. PyTorch, run_in_executor) block process exit.
+_SHUTDOWN_FORCE_EXIT_SECONDS = 5
+
+_force_exit_timer_started = False
+_force_exit_lock = threading.Lock()
+_original_sigterm = None
+_original_sigint = None
+
+
+def _force_exit_after_delay() -> None:
+    time.sleep(_SHUTDOWN_FORCE_EXIT_SECONDS)
+    os._exit(0)
+
+
+def _shutdown_signal_handler(signum: int, frame: object) -> None:
+    global _force_exit_timer_started
+    with _force_exit_lock:
+        if not _force_exit_timer_started:
+            _force_exit_timer_started = True
+            t = threading.Thread(target=_force_exit_after_delay, daemon=True)
+            t.start()
+    handler = _original_sigterm if signum == signal.SIGTERM else _original_sigint
+    if callable(handler):
+        handler(signum, frame)
+    elif signum == signal.SIGINT:
+        raise KeyboardInterrupt()
+    else:
+        raise SystemExit(0)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Install signal handlers so that if graceful shutdown hangs (e.g. PyTorch/executor threads),
+    # the process still exits after _SHUTDOWN_FORCE_EXIT_SECONDS.
+    global _original_sigterm, _original_sigint
+    if hasattr(signal, "SIGTERM"):
+        _original_sigterm = signal.signal(signal.SIGTERM, _shutdown_signal_handler)
+    _original_sigint = signal.signal(signal.SIGINT, _shutdown_signal_handler)
+
     # Startup: remove orphan temp files from previous runs (upload_*, audio_split_*, old tmp* spool; single listdir)
     await asyncio.to_thread(cleanup_orphaned_temp_files)
     # Background: periodically remove expired uploads

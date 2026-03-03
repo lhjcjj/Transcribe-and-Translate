@@ -2,19 +2,43 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { jsPDF } from "jspdf";
 import {
   cancelSplitStream,
+  deleteArticle,
+  deleteSummary,
   deleteTranscription,
+  deleteTranslation,
   deleteUpload,
+  getArticle,
+  getSummary,
   getTranscription,
+  getTranslation,
   getUploadConfig,
   getUploadDuration,
+  listSummaries,
   listTranscriptions,
+  listTranslations,
+  listArticles,
+  saveSummary,
+  saveTranslation,
+  saveArticle,
+  summarize,
   transcribe,
   transcribeByUploadIdsStream,
+  translate,
   upload,
   TranscribeApiResult,
   TranscribeEngine,
   TranscriptionListItem,
+  TranslationListItem,
+  SummaryListItem,
+  ArticleListItem,
 } from "./api/client";
+import deleteIcon from "./assets/icons/delete-icon.svg";
+import downloadIcon from "./assets/icons/download-icon.svg";
+import summarizeIcon from "./assets/icons/summarize-icon.svg";
+import translateIcon from "./assets/icons/translate-icon.svg";
+import wechatIcon from "./assets/icons/wechat-icon.svg";
+import notionIcon from "./assets/icons/notion-icon.svg";
+import previewIcon from "./assets/icons/preview-icon.svg";
 import { FileUpload } from "./components/FileUpload";
 import { TranscribeResult } from "./components/TranscribeResult";
 import { useSplitFlow } from "./hooks/useSplitFlow";
@@ -83,6 +107,102 @@ function formatCreatedAt(createdAt: number | null): string {
   return `${y}-${mo}-${day} ${h}:${min}:${s}`;
 }
 
+/** Remove common audio/file extensions from display name (e.g. .mp3, .wav). */
+function stripDisplayNameExtension(name: string): string {
+  if (!name || typeof name !== "string") return name;
+  return name.replace(/\.(mp3|wav|m4a|flac|ogg|webm|mp4|aac|opus|wma)$/i, "");
+}
+
+/** True if string contains CJK or other characters not in Helvetica's repertoire (e.g. Chinese). */
+function hasCjkOrNonLatin(text: string): boolean {
+  return /[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\uac00-\ud7af]/.test(text);
+}
+
+/** Wrap text into lines that fit within maxWidthPx when measured with ctx. */
+function wrapTextToLines(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidthPx: number
+): string[] {
+  const lines: string[] = [];
+  const paragraphs = text.split(/\n\n+/);
+  for (const para of paragraphs) {
+    const rawLines = para.split(/\n/);
+    for (const raw of rawLines) {
+      if (maxWidthPx <= 0) {
+        lines.push(raw);
+        continue;
+      }
+      let line = "";
+      for (const char of raw) {
+        const next = line + char;
+        if (ctx.measureText(next).width <= maxWidthPx) {
+          line = next;
+        } else {
+          if (line) lines.push(line);
+          line = char;
+        }
+      }
+      if (line) lines.push(line);
+    }
+    if (lines.length > 0 && paragraphs.indexOf(para) < paragraphs.length - 1) lines.push("");
+  }
+  return lines;
+}
+
+/** 1 pt = 25.4/72 mm (points to mm for canvas scaling). */
+const PT_TO_MM = 25.4 / 72;
+
+/** Draw one PDF page of text onto a canvas (for CJK support). Returns canvas. Font sizes in pt to match English PDF. */
+function drawPdfPageToCanvas(
+  pageLines: string[],
+  opts: {
+    pageWidthMm: number;
+    pageHeightMm: number;
+    marginMm: number;
+    titleLines?: string[];
+    titleFontSizePt: number;
+    bodyFontSizePt: number;
+    lineHeightMm: number;
+    scale?: number;
+  }
+): HTMLCanvasElement {
+  const scale = opts.scale ?? 2;
+  const pxPerMm = (595.28 / opts.pageWidthMm) * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = opts.pageWidthMm * pxPerMm;
+  canvas.height = opts.pageHeightMm * pxPerMm;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return canvas;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#000000";
+  const marginPx = opts.marginMm * pxPerMm;
+  const lineHeightPx = opts.lineHeightMm * pxPerMm;
+  const titleFontPx = opts.titleFontSizePt * PT_TO_MM * pxPerMm;
+  const bodyFontPx = opts.bodyFontSizePt * PT_TO_MM * pxPerMm;
+  const fontFamily = '"Noto Sans SC", "PingFang SC", "Microsoft YaHei", "SimHei", sans-serif';
+  let y = marginPx;
+
+  if (opts.titleLines?.length) {
+    ctx.font = `bold ${titleFontPx}px ${fontFamily}`;
+    for (const titleLine of opts.titleLines) {
+      ctx.fillText(titleLine, marginPx, y);
+      y += lineHeightPx;
+    }
+    y += lineHeightPx;
+  }
+
+  ctx.font = `${bodyFontPx}px ${fontFamily}`;
+  for (const line of pageLines) {
+    if (y > canvas.height - marginPx) break;
+    ctx.fillText(line, marginPx, y);
+    y += lineHeightPx;
+  }
+
+  return canvas;
+}
+
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
   useEffect(() => {
@@ -95,7 +215,11 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 export default function App() {
   const [langOption, setLangOption] = useState<"auto" | "en" | "zh">("auto");
   const [cleanOption, setCleanOption] = useState<"yes" | "no">("yes");
-  const [historyOpen, setHistoryOpen] = useState(true);
+  const [translateOption, setTranslateOption] = useState<"en-cn" | "cn-en">("en-cn");
+  const [transcribeHistoryOpen, setTranscribeHistoryOpen] = useState(true);
+  const [translateHistoryOpen, setTranslateHistoryOpen] = useState(true);
+  const [summarizeHistoryOpen, setSummarizeHistoryOpen] = useState(true);
+  const [restructureHistoryOpen, setRestructureHistoryOpen] = useState(true);
   const [uploadFileName, setUploadFileName] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadId, setUploadId] = useState<string | null>(null);
@@ -121,12 +245,12 @@ export default function App() {
   } | null>(null);
   const [showDownloadDialog, setShowDownloadDialog] = useState(false);
   /** When set, download dialog is for this history item (PDF/TXT); when null, for current transcribe result. */
-  const [pendingHistoryDownload, setPendingHistoryDownload] = useState<TranscriptionListItem | null>(null);
-  const [pendingDeleteItem, setPendingDeleteItem] = useState<TranscriptionListItem | null>(null);
-  const [historyItems, setHistoryItems] = useState<TranscriptionListItem[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
-  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [pendingTranscriptionDownload, setPendingTranscriptionDownload] = useState<TranscriptionListItem | null>(null);
+  const [pendingDeleteTranscriptionItem, setPendingDeleteTranscriptionItem] = useState<TranscriptionListItem | null>(null);
+  const [transcribeHistoryItems, setTranscribeHistoryItems] = useState<TranscriptionListItem[]>([]);
+  const [transcribeHistoryLoading, setTranscribeHistoryLoading] = useState(false);
+  const [transcribeHistoryLoadingMore, setTranscribeHistoryLoadingMore] = useState(false);
+  const [transcribeHistoryHasMore, setTranscribeHistoryHasMore] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadAbortRef = useRef<AbortController | null>(null);
   const apiAbortRef = useRef<AbortController | null>(null);
@@ -136,7 +260,44 @@ export default function App() {
   const uploadGenerationRef = useRef(0);
   const downloadRevokeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [maxUploadBytes, setMaxUploadBytes] = useState<number | null>(null);
-  const [transcribeEngine, setTranscribeEngine] = useState<TranscribeEngine>("faster_whisper");
+  /** Local vs API: applies to translation and summarize; transcribe always uses local for now. */
+  const [selectedEngine, setSelectedEngine] = useState<"local" | "api">("api");
+  const transcribeEngine: TranscribeEngine = "faster_whisper";
+  const [translateResult, setTranslateResult] = useState<string | null>(null);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translateError, setTranslateError] = useState<string | null>(null);
+  const [summarizeResult, setSummarizeResult] = useState<string | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  const [summarizeError, setSummarizeError] = useState<string | null>(null);
+  const [summarizeSource, setSummarizeSource] = useState<"all" | "transcript" | "translation">("all");
+  /** Translation history: list of { id, display_name, created_at, text } (client-side only). */
+  const [translateHistoryItems, setTranslateHistoryItems] = useState<TranslationListItem[]>([]);
+  const [pendingTranslationDownload, setPendingTranslationDownload] = useState<TranslationListItem | null>(null);
+  const [pendingDeleteTranslationItem, setPendingDeleteTranslationItem] = useState<TranslationListItem | null>(null);
+  /** Summary history: same pattern as translation (list from API, get for download, delete from API). */
+  const [summarizeHistoryItems, setSummarizeHistoryItems] = useState<SummaryListItem[]>([]);
+  const [pendingSummaryDownload, setPendingSummaryDownload] = useState<SummaryListItem | null>(null);
+  const [pendingDeleteSummaryItem, setPendingDeleteSummaryItem] = useState<SummaryListItem | null>(null);
+  const [pendingDeleteArticleItem, setPendingDeleteArticleItem] = useState<ArticleListItem | null>(null);
+  const [pendingArticleDownload, setPendingArticleDownload] = useState<ArticleListItem | null>(null);
+  /** Restructure history: list from API (articles). */
+  const [restructureHistoryItems, setRestructureHistoryItems] = useState<ArticleListItem[]>([]);
+  /** When set, show "Choose translation direction." dialog for this transcription history item. */
+  const [pendingTranslateFromHistoryItem, setPendingTranslateFromHistoryItem] = useState<TranscriptionListItem | null>(null);
+  const [pendingSummarizeTranscriptionItem, setPendingSummarizeTranscriptionItem] = useState<TranscriptionListItem | null>(null);
+  const [pendingSummarizeTranslationItem, setPendingSummarizeTranslationItem] = useState<TranslationListItem | null>(null);
+  const [downloadSource, setDownloadSource] = useState<"transcription" | "translation" | "summary" | "restructure" | null>(null);
+  const [restructureDialogOpen, setRestructureDialogOpen] = useState(false);
+  const [restructureSelectedTranscriptionIds, setRestructureSelectedTranscriptionIds] = useState<string[]>([]);
+  const [restructureSelectedTranslationIds, setRestructureSelectedTranslationIds] = useState<string[]>([]);
+  const [restructureSelectedSummaryIds, setRestructureSelectedSummaryIds] = useState<string[]>([]);
+  const [restructureResultFilesLabel, setRestructureResultFilesLabel] = useState("");
+  const [isRestructuring, setIsRestructuring] = useState(false);
+  const [restructureResultText, setRestructureResultText] = useState("");
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewTitle, setPreviewTitle] = useState("");
+  const [previewText, setPreviewText] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   // If this component ever calls translate(), pass apiAbortRef.current?.signal so the request is aborted on unmount.
   useEffect(() => {
@@ -154,44 +315,65 @@ export default function App() {
   const HISTORY_PAGE_SIZE = 50;
 
   useEffect(() => {
-    if (!historyOpen) return;
-    setHistoryLoading(true);
-    setHistoryHasMore(true);
+    if (!transcribeHistoryOpen) return;
+    setTranscribeHistoryLoading(true);
+    setTranscribeHistoryHasMore(true);
     listTranscriptions({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
       .then((data) => {
-        setHistoryItems(data);
-        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+        setTranscribeHistoryItems(data);
+        setTranscribeHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
       })
-      .catch(() => setHistoryItems([]))
-      .finally(() => setHistoryLoading(false));
-  }, [historyOpen]);
+      .catch(() => setTranscribeHistoryItems([]))
+      .finally(() => setTranscribeHistoryLoading(false));
+  }, [transcribeHistoryOpen]);
+
+  useEffect(() => {
+    if (!translateHistoryOpen) return;
+    listTranslations({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+      .then((data) => setTranslateHistoryItems(data))
+      .catch(() => setTranslateHistoryItems([]));
+  }, [translateHistoryOpen]);
+
+  useEffect(() => {
+    if (!summarizeHistoryOpen) return;
+    listSummaries({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+      .then((data) => setSummarizeHistoryItems(data))
+      .catch(() => setSummarizeHistoryItems([]));
+  }, [summarizeHistoryOpen]);
+
+  useEffect(() => {
+    if (!restructureHistoryOpen) return;
+    listArticles({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+      .then((data) => setRestructureHistoryItems(data))
+      .catch(() => setRestructureHistoryItems([]));
+  }, [restructureHistoryOpen]);
 
   // After a successful transcribe, refresh history list if panel is open so the new item appears.
   useEffect(() => {
-    if (!historyOpen || !transcribeText) return;
+    if (!transcribeHistoryOpen || !transcribeText) return;
     listTranscriptions({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
       .then((data) => {
-        setHistoryItems(data);
-        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+        setTranscribeHistoryItems(data);
+        setTranscribeHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
       })
       .catch(() => {});
-  }, [historyOpen, transcribeText]);
+  }, [transcribeHistoryOpen, transcribeText]);
 
-  const handleHistoryLoadMore = useCallback(() => {
-    if (historyLoadingMore || !historyHasMore) return;
-    setHistoryLoadingMore(true);
+  const handleTranscribeHistoryLoadMore = useCallback(() => {
+    if (transcribeHistoryLoadingMore || !transcribeHistoryHasMore) return;
+    setTranscribeHistoryLoadingMore(true);
     listTranscriptions({
       limit: HISTORY_PAGE_SIZE,
-      offset: historyItems.length,
+      offset: transcribeHistoryItems.length,
       signal: apiAbortRef.current?.signal,
     })
       .then((data) => {
-        setHistoryItems((prev) => [...prev, ...data]);
-        setHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
+        setTranscribeHistoryItems((prev) => [...prev, ...data]);
+        setTranscribeHistoryHasMore(data.length >= HISTORY_PAGE_SIZE);
       })
       .catch(() => {})
-      .finally(() => setHistoryLoadingMore(false));
-  }, [historyLoadingMore, historyHasMore, historyItems.length]);
+      .finally(() => setTranscribeHistoryLoadingMore(false));
+  }, [transcribeHistoryLoadingMore, transcribeHistoryHasMore, transcribeHistoryItems.length]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -199,6 +381,8 @@ export default function App() {
     getUploadConfig({ signal: controller.signal })
       .then((c) => setMaxUploadBytes(c.max_upload_bytes))
       .catch((err) => {
+        // Ignore aborts (React strict mode mounts/unmounts effects).
+        if (err instanceof DOMException && err.name === "AbortError") return;
         console.error("Failed to load upload config");
         // Only in dev; production build does not expose stack.
         if (import.meta.env.DEV && err) console.error(err);
@@ -215,6 +399,17 @@ export default function App() {
         Math.min(CHUNK_SIZE_MAX, parseInt(chunkSizeDebounced, 10) || 5)
       ),
     [chunkSizeDebounced]
+  );
+  const restructureSelectedCount = useMemo(
+    () =>
+      restructureSelectedTranscriptionIds.length +
+      restructureSelectedTranslationIds.length +
+      restructureSelectedSummaryIds.length,
+    [
+      restructureSelectedTranscriptionIds.length,
+      restructureSelectedTranslationIds.length,
+      restructureSelectedSummaryIds.length,
+    ],
   );
   const clearUploadState = useCallback(() => {
     setUploadId(null);
@@ -233,7 +428,7 @@ export default function App() {
     },
     [clearUploadState]
   );
-  const { doSplit, isSplitting, splitProgress, splitAbortRef } = useSplitFlow(
+  const { split, isSplitting, splitProgress, splitAbortRef } = useSplitFlow(
     uploadId,
     chunkSizeMin,
     onSplitSuccess,
@@ -304,10 +499,10 @@ export default function App() {
       selectedFile == null
         ? "MB:%"
         : isUploading && uploadProgress != null
-          ? ` MB: ${uploadProgress}%`
+          ? `MB: ${uploadProgress}%`
           : isUploaded
-            ? " MB: 100%"
-            : " MB:%",
+            ? "MB: 100%"
+            : "MB:%",
     [selectedFile, isUploading, uploadProgress, isUploaded]
   );
   const fileSizeAddon = useMemo(
@@ -321,6 +516,7 @@ export default function App() {
           ) : (
             fileSizeMB
           )}
+          {"\u00A0"}
           {fileSizeAddonSuffix}
         </>
       ) : (
@@ -358,6 +554,7 @@ export default function App() {
       setTranscribeSegments(null);
       setFailedChunkIds(null);
       setFailedChunkIndices(null);
+      setTranscribeChunkProgress(null);
       setUploadFileName(file.name);
       setSelectedFile(file);
       e.target.value = "";
@@ -505,8 +702,8 @@ export default function App() {
       setConfirmCancelType("split");
       return;
     }
-    doSplit();
-  }, [isSplitting, doSplit]);
+    split();
+  }, [isSplitting, split]);
 
   const handleTranscribe = useCallback(
     async () => {
@@ -602,8 +799,66 @@ export default function App() {
       const pageHeight = doc.internal.pageSize.getHeight();
       const maxLineWidth = pageWidth - margin * 2;
       const lineHeight = 10;
-      let y = margin;
+      const useCjkCanvas = hasCjkOrNonLatin(text) || (filenameBase ? hasCjkOrNonLatin(filenameBase) : false);
 
+      if (useCjkCanvas) {
+        const scale = 2;
+        const pxPerMm = (595.28 / pageWidth) * scale;
+        const maxLineWidthPx = maxLineWidth * pxPerMm;
+        const tempCanvas = document.createElement("canvas");
+        const tempCtx = tempCanvas.getContext("2d");
+        if (tempCtx) {
+          const titleFontSizePt = 14;
+          const bodyFontSizePt = 10;
+          const bodyFontPx = bodyFontSizePt * PT_TO_MM * pxPerMm;
+          const titleFontPx = titleFontSizePt * PT_TO_MM * pxPerMm;
+          tempCtx.font = `${bodyFontPx}px "Noto Sans SC", sans-serif`;
+          const bodyLines = wrapTextToLines(tempCtx, text, maxLineWidthPx);
+          tempCtx.font = `bold ${titleFontPx}px "Noto Sans SC", sans-serif`;
+          const titleLines = filenameBase ? wrapTextToLines(tempCtx, filenameBase, maxLineWidthPx) : [];
+          const linesPerPage = Math.max(1, Math.floor((pageHeight - margin * 2) / lineHeight));
+          const firstPageBodyCap = titleLines.length > 0
+            ? Math.max(0, linesPerPage - titleLines.length - 1)
+            : linesPerPage;
+          let bodyIndex = 0;
+          for (let p = 0; p < 100; p++) {
+            const pageTitle = p === 0 ? titleLines : undefined;
+            const pageBody = bodyLines.slice(
+              bodyIndex,
+              bodyIndex + (p === 0 ? firstPageBodyCap : linesPerPage)
+            );
+            bodyIndex += p === 0 ? firstPageBodyCap : linesPerPage;
+            if (pageTitle?.length || pageBody.length) {
+              if (p > 0) doc.addPage();
+              const canvas = drawPdfPageToCanvas(pageBody, {
+                pageWidthMm: pageWidth,
+                pageHeightMm: pageHeight,
+                marginMm: margin,
+                titleLines: pageTitle,
+                titleFontSizePt,
+                bodyFontSizePt,
+                lineHeightMm: lineHeight,
+                scale,
+              });
+              doc.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, pageWidth, pageHeight);
+            }
+            if (bodyIndex >= bodyLines.length) break;
+          }
+          const blob = doc.output("blob");
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${downloadBaseName(filenameBase)}.pdf`;
+          a.click();
+          downloadRevokeTimeoutRef.current = setTimeout(() => {
+            URL.revokeObjectURL(url);
+            downloadRevokeTimeoutRef.current = null;
+          }, DOWNLOAD_REVOKE_DELAY_MS);
+          return;
+        }
+      }
+
+      let y = margin;
       if (filenameBase) {
         doc.setFontSize(14);
         doc.setFont("helvetica", "bold");
@@ -661,35 +916,471 @@ export default function App() {
     }, DOWNLOAD_REVOKE_DELAY_MS);
   }, []);
 
-  const handleDownloadTranscribe = useCallback((format: "txt" | "pdf") => {
-    if (!transcribeText) return;
-    doDownload(transcribeText, format, downloadBaseName(uploadFileName));
-  }, [transcribeText, uploadFileName, doDownload]);
-
   const handleDownloadDialogChoose = useCallback(async (format: "pdf" | "txt") => {
-    const item = pendingHistoryDownload;
+    const summaryItem = pendingSummaryDownload;
+    const translationItem = pendingTranslationDownload;
+    const transcriptionItem = pendingTranscriptionDownload;
+    const articleItem = pendingArticleDownload;
     setShowDownloadDialog(false);
-    setPendingHistoryDownload(null);
-    if (item) {
+    setPendingTranscriptionDownload(null);
+    setPendingTranslationDownload(null);
+    setPendingSummaryDownload(null);
+    setPendingArticleDownload(null);
+    const source = downloadSource;
+    setDownloadSource(null);
+    if (articleItem) {
       try {
-        const detail = await getTranscription(item.id, { signal: apiAbortRef.current?.signal });
-        doDownload(detail.text, format, item.display_name);
+        const detail = await getArticle(articleItem.id, { signal: apiAbortRef.current?.signal });
+        doDownload(detail.text, format, detail.display_name);
+      } catch {
+        // Error from getArticle; dialog already closed
+      }
+      return;
+    }
+    if (summaryItem) {
+      try {
+        const detail = await getSummary(summaryItem.id, { signal: apiAbortRef.current?.signal });
+        doDownload(detail.text, format, detail.display_name);
+      } catch {
+        // Error from getSummary; dialog already closed
+      }
+      return;
+    }
+    if (translationItem) {
+      try {
+        const detail = await getTranslation(translationItem.id, { signal: apiAbortRef.current?.signal });
+        doDownload(detail.text, format, detail.display_name);
+      } catch {
+        // Error from getTranslation; dialog already closed
+      }
+      return;
+    }
+    if (transcriptionItem) {
+      try {
+        const detail = await getTranscription(transcriptionItem.id, { signal: apiAbortRef.current?.signal });
+        doDownload(detail.text, format, detail.display_name);
       } catch {
         // Error from getTranscription; dialog already closed
       }
       return;
     }
-    if (transcribeText) doDownload(transcribeText, format, downloadBaseName(uploadFileName));
-  }, [pendingHistoryDownload, transcribeText, uploadFileName, doDownload]);
+    if (source === "summary" && summarizeResult) {
+      doDownload(summarizeResult, format, uploadFileName || "Current summary");
+      return;
+    }
+    if (source === "translation" && translateResult) {
+      doDownload(translateResult, format, uploadFileName || "Current translation");
+      return;
+    }
+    if (source === "transcription" && transcribeText) {
+      doDownload(transcribeText, format, downloadBaseName(uploadFileName));
+      return;
+    }
+    if (source === "restructure" && restructureResultText) {
+      doDownload(restructureResultText, format, "restructure");
+    }
+  }, [
+    pendingTranscriptionDownload,
+    pendingTranslationDownload,
+    pendingSummaryDownload,
+    pendingArticleDownload,
+    transcribeText,
+    translateResult,
+    summarizeResult,
+    restructureResultText,
+    uploadFileName,
+    doDownload,
+    downloadSource,
+  ]);
 
-  const handleHistoryDelete = useCallback(async (item: TranscriptionListItem) => {
+  const handleDeleteTranscriptionItem = useCallback(async (item: TranscriptionListItem) => {
     try {
       await deleteTranscription(item.id, { signal: apiAbortRef.current?.signal });
-      setHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
+      setTranscribeHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
     } catch {
       // Error already user-facing from deleteTranscription; keep list unchanged
     }
   }, []);
+
+  const handleDeleteTranslationItem = useCallback(async (item: TranslationListItem) => {
+    try {
+      await deleteTranslation(item.id, { signal: apiAbortRef.current?.signal });
+      setTranslateHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
+    } catch {
+      // Error from deleteTranslation; keep list unchanged
+    }
+  }, []);
+
+  const handleDeleteSummaryItem = useCallback(async (item: SummaryListItem) => {
+    try {
+      await deleteSummary(item.id, { signal: apiAbortRef.current?.signal });
+      setSummarizeHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
+    } catch {
+      // Error from deleteSummary; keep list unchanged
+    }
+  }, []);
+
+  const handleDeleteArticleItem = useCallback(async (item: ArticleListItem) => {
+    try {
+      await deleteArticle(item.id, { signal: apiAbortRef.current?.signal });
+      setRestructureHistoryItems((prev) => prev.filter((x) => x.id !== item.id));
+    } catch {
+      // Error from deleteArticle; keep list unchanged
+    }
+  }, []);
+
+  const addTranslationToHistory = useCallback(
+    async (display_name: string, text: string) => {
+      try {
+        const saved = await saveTranslation(display_name, text, { signal: apiAbortRef.current?.signal });
+        setTranslateHistoryItems((prev) => [saved, ...prev]);
+      } catch {
+        // Best-effort: list will not show this entry; user still has result in textarea
+      }
+    },
+    []
+  );
+
+  const handleTranslate = useCallback(async () => {
+    if (!transcribeText?.trim() || isTranslating) return;
+    setTranslateError(null);
+    setTranslateResult(null);
+    setIsTranslating(true);
+    try {
+      const targetLang = translateOption === "en-cn" ? "zh" : "en";
+      const res = await translate(transcribeText.trim(), targetLang, {
+        signal: apiAbortRef.current?.signal,
+        engine: selectedEngine,
+      });
+      setTranslateResult(res.text);
+      addTranslationToHistory(uploadFileName || "Current transcript", res.text);
+    } catch (e) {
+      setTranslateResult(null);
+      setTranslateError(e instanceof Error ? e.message : "Translation failed");
+    } finally {
+      setIsTranslating(false);
+    }
+  }, [transcribeText, translateOption, isTranslating, uploadFileName, addTranslationToHistory, selectedEngine]);
+
+  const runTranslateFromHistoryItem = useCallback(
+    async (item: TranscriptionListItem, direction: "en-cn" | "cn-en") => {
+      if (isTranslating) return;
+      setTranslateResult(null);
+      setTranslateError(null);
+      setIsTranslating(true);
+      try {
+        const detail = await getTranscription(item.id, { signal: apiAbortRef.current?.signal });
+        const targetLang = direction === "en-cn" ? "zh" : "en";
+        const res = await translate(detail.text.trim(), targetLang, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine,
+        });
+        setTranslateResult(res.text);
+        addTranslationToHistory(item.display_name, res.text);
+      } catch (e) {
+        setTranslateResult(null);
+        setTranslateError(e instanceof Error ? e.message : "Translation failed");
+      } finally {
+        setIsTranslating(false);
+      }
+    },
+    [isTranslating, addTranslationToHistory, selectedEngine]
+  );
+
+  const addSummaryToHistory = useCallback(
+    async (display_name: string, text: string) => {
+      try {
+        await saveSummary(display_name, text, { signal: apiAbortRef.current?.signal });
+        const data = await listSummaries({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal });
+        setSummarizeHistoryItems(data);
+      } catch {
+        // Error from saveSummary; list unchanged
+      }
+    },
+    []
+  );
+
+  const runSummarizeFromTranscriptionItem = useCallback(
+    async (item: TranscriptionListItem) => {
+      if (isSummarizing) return;
+      setSummarizeError(null);
+      setSummarizeResult(null);
+      setIsSummarizing(true);
+      setSummarizeSource("transcript");
+      try {
+        const detail = await getTranscription(item.id, { signal: apiAbortRef.current?.signal });
+        const text = detail.text?.trim();
+        if (!text) {
+          setSummarizeResult(null);
+          setSummarizeError("Empty transcript text");
+          return;
+        }
+        const res = await summarize(text, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        const baseName = stripDisplayNameExtension(item.display_name) || "Transcript";
+        await addSummaryToHistory(`${baseName}(sum-transcript)`, res.text);
+      } catch (e) {
+        setSummarizeResult(null);
+        setSummarizeError(e instanceof Error ? e.message : "Summary failed");
+      } finally {
+        setIsSummarizing(false);
+      }
+    },
+    [isSummarizing, selectedEngine, addSummaryToHistory]
+  );
+
+  const runSummarizeFromTranslationItem = useCallback(
+    async (item: TranslationListItem) => {
+      if (isSummarizing) return;
+      setSummarizeError(null);
+      setSummarizeResult(null);
+      setIsSummarizing(true);
+      setSummarizeSource("translation");
+      try {
+        const detail = await getTranslation(item.id, { signal: apiAbortRef.current?.signal });
+        const text = detail.text?.trim();
+        if (!text) {
+          setSummarizeResult(null);
+          setSummarizeError("Empty translation text");
+          return;
+        }
+        const res = await summarize(text, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        const baseName = stripDisplayNameExtension(item.display_name) || "Translation";
+        await addSummaryToHistory(`${baseName}(sum-translation)`, res.text);
+      } catch (e) {
+        setSummarizeResult(null);
+        setSummarizeError(e instanceof Error ? e.message : "Summary failed");
+      } finally {
+        setIsSummarizing(false);
+      }
+    },
+    [isSummarizing, selectedEngine, addSummaryToHistory]
+  );
+
+  const handleTranslateDirectionChoose = useCallback(
+    (direction: "en-cn" | "cn-en") => {
+      const item = pendingTranslateFromHistoryItem;
+      setPendingTranslateFromHistoryItem(null);
+      setTranslateOption(direction);
+      if (item) runTranslateFromHistoryItem(item, direction);
+    },
+    [pendingTranslateFromHistoryItem, runTranslateFromHistoryItem]
+  );
+
+  const handleSummarize = useCallback(async () => {
+    const transcript = transcribeText?.trim() || "";
+    const translation = translateResult?.trim() || "";
+    if ((!transcript && !translation) || isSummarizing) return;
+    setSummarizeError(null);
+    setSummarizeResult(null);
+    setIsSummarizing(true);
+    try {
+      const baseName = uploadFileName || "Current";
+
+      // 单独来源：只生成一个总结文件
+      if (summarizeSource === "transcript") {
+        if (!transcript) {
+          setSummarizeResult(null);
+          setSummarizeError("No transcript to summarize");
+          return;
+        }
+        const res = await summarize(transcript, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        await addSummaryToHistory(`${baseName}(sum-transcript)`, res.text);
+        return;
+      }
+      if (summarizeSource === "translation") {
+        if (!translation) {
+          setSummarizeResult(null);
+          setSummarizeError("No translation to summarize");
+          return;
+        }
+        const res = await summarize(translation, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        await addSummaryToHistory(`${baseName}(sum-translation)`, res.text);
+        return;
+      }
+
+      // summarizeSource === "all": 生成两个 summary 结果文件
+      if (!transcript && !translation) {
+        setSummarizeResult(null);
+        setSummarizeError("No text to summarize");
+        return;
+      }
+
+      if (transcript && translation) {
+        const [resTranscript, resTranslation] = await Promise.all([
+          summarize(transcript, {
+            signal: apiAbortRef.current?.signal,
+            engine: selectedEngine === "local" ? "local" : "api",
+          }),
+          summarize(translation, {
+            signal: apiAbortRef.current?.signal,
+            engine: selectedEngine === "local" ? "local" : "api",
+          }),
+        ]);
+        const combined =
+          `Transcript summary:\n${resTranscript.text}\n\n` +
+          `Translation summary:\n${resTranslation.text}`;
+        setSummarizeResult(combined);
+        await addSummaryToHistory(`${baseName}(sum-transcript)`, resTranscript.text);
+        await addSummaryToHistory(`${baseName}(sum-translation)`, resTranslation.text);
+        return;
+      }
+
+      // all 但只存在一类文本时，退化为单独来源逻辑
+      if (transcript) {
+        const res = await summarize(transcript, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        await addSummaryToHistory(`${baseName}(sum-transcript)`, res.text);
+      } else if (translation) {
+        const res = await summarize(translation, {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine === "local" ? "local" : "api",
+        });
+        setSummarizeResult(res.text);
+        await addSummaryToHistory(`${baseName}(sum-translation)`, res.text);
+      }
+    } catch (e) {
+      setSummarizeResult(null);
+      setSummarizeError(e instanceof Error ? e.message : "Summary failed");
+    } finally {
+      setIsSummarizing(false);
+    }
+  }, [transcribeText, translateResult, summarizeSource, isSummarizing, uploadFileName, addSummaryToHistory]);
+
+  const handleRestructure = useCallback(
+    async () => {
+      if (isRestructuring || restructureSelectedCount === 0) return;
+      setIsRestructuring(true);
+      try {
+        const summaryTranscriptParts: string[] = [];
+        const summaryTranslationParts: string[] = [];
+        let transcriptText: string | null = null;
+        let translationText: string | null = null;
+
+        // Summaries: include up to 2 selected, in the order they were selected.
+        if (restructureSelectedSummaryIds.length) {
+          const selectedSummaries = restructureSelectedSummaryIds
+            .slice(0, 2)
+            .map((sid) => summarizeHistoryItems.find((x) => x.id === sid))
+            .filter((x): x is SummaryListItem => Boolean(x));
+          if (selectedSummaries.length) {
+            const details = await Promise.all(
+              selectedSummaries.map((item) =>
+                getSummary(item.id, { signal: apiAbortRef.current?.signal }),
+              ),
+            );
+            details.forEach((d, idx) => {
+              const item = selectedSummaries[idx];
+              const text = d.text?.trim();
+              if (!text) return;
+              const name = item.display_name.toLowerCase();
+              if (name.endsWith("(sum-transcript)")) {
+                summaryTranscriptParts.push(text);
+              } else if (name.endsWith("(sum-translation)")) {
+                summaryTranslationParts.push(text);
+              } else {
+                // Fallback：未标明类型的 summary 归到 summaryTranscript
+                summaryTranscriptParts.push(text);
+              }
+            });
+          }
+        }
+
+        // Transcript
+        let articleBaseName: string | null = null;
+        if (restructureSelectedTranscriptionIds.length) {
+          const tid = restructureSelectedTranscriptionIds[0];
+          const tItem = transcribeHistoryItems.find((x) => x.id === tid) || null;
+          if (tItem) {
+            const detail = await getTranscription(tid, { signal: apiAbortRef.current?.signal });
+            const text = detail.text?.trim();
+            if (text) transcriptText = text;
+            const base = stripDisplayNameExtension(tItem.display_name).replace(/\(raw\)$/i, "").trim();
+            if (base) articleBaseName = `${base}(art)`;
+          }
+        }
+
+        // Translation
+        if (restructureSelectedTranslationIds.length) {
+          const trid = restructureSelectedTranslationIds[0];
+          const trItem = translateHistoryItems.find((x) => x.id === trid) || null;
+          if (trItem) {
+            const detail = await getTranslation(trid, { signal: apiAbortRef.current?.signal });
+            const text = detail.text?.trim();
+            if (text) translationText = text;
+            if (!articleBaseName) {
+              const base = stripDisplayNameExtension(trItem.display_name).replace(/\(trans\)$/i, "").trim();
+              if (base) articleBaseName = `${base}(art)`;
+            }
+          }
+        }
+
+        const sections: string[] = [];
+        sections.push(
+          `summary：\n${
+            summaryTranscriptParts.length ? summaryTranscriptParts.join("\n\n") : "none"
+          }`,
+        );
+        sections.push(
+          `摘要：\n${
+            summaryTranslationParts.length ? summaryTranslationParts.join("\n\n") : "暂无"
+          }`,
+        );
+        sections.push(`transcript：\n${transcriptText || "none"}`);
+        sections.push(`翻译：\n${translationText || "暂无"}`);
+
+        const combinedText = sections.join("\n\n\n").trim();
+        if (!combinedText) return;
+
+        setRestructureResultText(combinedText);
+        // Clear current file selections and label after a successful restructure
+        setRestructureSelectedTranscriptionIds([]);
+        setRestructureSelectedTranslationIds([]);
+        setRestructureSelectedSummaryIds([]);
+        setRestructureResultFilesLabel("");
+
+        const saved = await saveArticle(articleBaseName || "", combinedText, {
+          signal: apiAbortRef.current?.signal,
+        });
+        setRestructureHistoryItems((prev) => [saved, ...prev]);
+        setRestructureHistoryOpen(true);
+      } catch {
+        // Best-effort: if restructure fails, do nothing visible; user can retry.
+      } finally {
+        setIsRestructuring(false);
+      }
+    },
+    [
+      isRestructuring,
+      restructureSelectedCount,
+      restructureSelectedSummaryIds,
+      restructureSelectedTranscriptionIds,
+      restructureSelectedTranslationIds,
+      summarizeHistoryItems,
+      transcribeHistoryItems,
+      translateHistoryItems,
+      apiAbortRef,
+      saveArticle,
+    ],
+  );
 
   const handleRetryFailedChunks = useCallback(
     async () => {
@@ -754,7 +1445,7 @@ export default function App() {
         : isTranscribing
           ? uploadFileName || "Transcribing…"
           : transcribeText != null
-            ? (uploadFileName || transcribeChunkProgress?.filename || "Task information")
+            ? (uploadFileName || "Task information")
             : "Task information",
     [transcribeChunkProgress, isTranscribing, uploadFileName, transcribeText]
   );
@@ -821,20 +1512,20 @@ export default function App() {
           <main className="main">
             <div className="main-title-row">
               <h1 className="main-title">Transcribe and Translate</h1>
-              <div className="engine-toggle" role="group" aria-label="Transcription engine">
+              <div className="engine-toggle" role="group" aria-label="Engine (transcription & translation)">
                 <button
                   type="button"
-                  className={`engine-option ${transcribeEngine === "faster_whisper" ? "is-active" : ""}`}
-                  onClick={() => setTranscribeEngine("faster_whisper")}
+                  className={`engine-option ${selectedEngine === "local" ? "is-active" : ""}`}
+                  onClick={() => setSelectedEngine("local")}
                 >
                   Local
                 </button>
                 <button
                   type="button"
-                  className={`engine-option ${transcribeEngine === "openai" ? "is-active" : ""}`}
-                  onClick={() => setTranscribeEngine("openai")}
+                  className={`engine-option ${selectedEngine === "api" ? "is-active" : ""}`}
+                  onClick={() => setSelectedEngine("api")}
                 >
-                  OpenAI
+                  API
                 </button>
               </div>
             </div>
@@ -844,7 +1535,7 @@ export default function App() {
               <span className="intro-placeholder" title="Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt">Transcribe .mp3、.mp4、.mpeg、.mpga、.m4a、.wav、.webm into .txt</span>
             </div>
 
-            <div className="steps">
+            <div className="steps steps-transcribe">
               <FileUpload
                 inputRef={fileInputRef}
                 fileName={uploadFileName}
@@ -966,7 +1657,18 @@ export default function App() {
                     >
                       {isTranscribing ? "transcribing…" : failedChunkIds?.length ? "retry failed" : "transcribe"}
                     </button>
-                    <button type="button" className="step-transcribe-download" disabled={!transcribeText} onClick={() => { setPendingHistoryDownload(null); setShowDownloadDialog(true); }}>download</button>
+                    <button
+                      type="button"
+                      className="step-transcribe-download"
+                      disabled={!transcribeText}
+                      onClick={() => {
+                        setPendingTranscriptionDownload(null);
+                        setDownloadSource("transcription");
+                        setShowDownloadDialog(true);
+                      }}
+                    >
+                      download
+                    </button>
                   </div>
                 </div>
                 <TranscribeResult text={transcribeText} error={transcribeError} />
@@ -974,31 +1676,85 @@ export default function App() {
             </div>
 
             <div className="history-files">
-              <button type="button" className={`history-toggle${historyOpen ? " is-open" : ""}`} onClick={() => setHistoryOpen((o) => !o)}>
-                {historyOpen ? "Transcription history ↑" : "Transcription history ↓"}
+              <button type="button" className={`history-toggle${transcribeHistoryOpen ? " is-open" : ""}`} onClick={() => setTranscribeHistoryOpen((o) => !o)}>
+                {transcribeHistoryOpen ? "Transcription history ↑" : "Transcription history ↓"}
               </button>
-              {historyOpen && (
+              {transcribeHistoryOpen && (
                 <ul className="history-list">
-                  {historyLoading ? (
+                  {transcribeHistoryLoading ? (
                     <li className="history-list-empty">Loading…</li>
-                  ) : historyItems.length === 0 ? (
-                    <li className="history-list-empty">No files yet</li>
+                  ) : transcribeHistoryItems.length === 0 ? (
+                    <li className="history-list-empty">No transcripts yet</li>
                   ) : (
                     <>
-                      {historyItems.map((item) => (
-                        <li key={item.id} className="history-item">
-                          <span className="history-item-name" title={item.display_name}>{item.display_name}</span>
-                          <span className="history-item-time">{formatCreatedAt(item.created_at)}</span>
+                      {transcribeHistoryItems.map((transcriptionItem) => (
+                        <li key={transcriptionItem.id} className="history-item">
+                          <span
+                            className="history-item-name"
+                            title={transcriptionItem.display_name}
+                          >
+                            {transcriptionItem.display_name}
+                          </span>
+                          <span className="history-item-time">{formatCreatedAt(transcriptionItem.created_at)}</span>
                           <span className="history-item-actions">
-                            <button type="button" className="history-item-download" onClick={() => { setPendingHistoryDownload(item); setShowDownloadDialog(true); }}>download</button>
-                            <button type="button" className="history-item-delete" onClick={() => setPendingDeleteItem(item)}>delete</button>
+                            <button
+                              type="button"
+                              className="history-item-translate"
+                              disabled={isTranslating}
+                              onClick={() => setPendingTranslateFromHistoryItem(transcriptionItem)}
+                              title="translate"
+                            >
+                              <img src={translateIcon} alt="" width={24} height={24} />
+                            </button>
+                            <button
+                              type="button"
+                              className="history-item-summarize"
+                              disabled={isSummarizing}
+                              title="summarize"
+                              onClick={() => setPendingSummarizeTranscriptionItem(transcriptionItem)}
+                            >
+                              <img src={summarizeIcon} alt="" width={24} height={24} />
+                            </button>
+                            <button
+                              type="button"
+                              className="history-item-preview"
+                              title="preview"
+                              onClick={async () => {
+                                setPreviewOpen(true);
+                                setPreviewTitle(stripDisplayNameExtension(transcriptionItem.display_name));
+                                setPreviewText("");
+                                setPreviewLoading(true);
+                                try {
+                                  const detail = await getTranscription(transcriptionItem.id, { signal: apiAbortRef.current?.signal });
+                                  setPreviewText(detail.text);
+                                } catch {
+                                  setPreviewText("Failed to load.");
+                                } finally {
+                                  setPreviewLoading(false);
+                                }
+                              }}
+                            >
+                              <img src={previewIcon} alt="" width={24} height={24} />
+                            </button>
+                            <button
+                              type="button"
+                              className="history-item-download"
+                              onClick={() => {
+                                setPendingTranscriptionDownload(transcriptionItem);
+                                setShowDownloadDialog(true);
+                              }}
+                              title="download"
+                            >
+                              <img src={downloadIcon} alt="" width={24} height={24} />
+                            </button>
+                            <button type="button" className="history-item-delete" disabled={isTranslating || isSummarizing} onClick={() => setPendingDeleteTranscriptionItem(transcriptionItem)} title="delete"><img src={deleteIcon} alt="" width={24} height={24} /></button>
                           </span>
                         </li>
                       ))}
-                      {historyHasMore && (
+                      {transcribeHistoryHasMore && (
                         <li className="history-list-load-more">
-                          <button type="button" className="history-load-more-btn" disabled={historyLoadingMore} onClick={handleHistoryLoadMore}>
-                            {historyLoadingMore ? "Loading…" : "Load more"}
+                          <button type="button" className="history-load-more-btn" disabled={transcribeHistoryLoadingMore} onClick={handleTranscribeHistoryLoadMore}>
+                            {transcribeHistoryLoadingMore ? "Loading…" : "Load more"}
                           </button>
                         </li>
                       )}
@@ -1007,8 +1763,416 @@ export default function App() {
                 </ul>
               )}
             </div>
+
+            <div className="steps step-translate">
+              <section className="step">
+                <div className="step-head">
+                  <span className="step-title">⑥    Translate:</span>
+                  <div className="step-row">
+                    <div className="step-wrap">
+                      <p className="step-desc">Translate the transcript to another language.</p>
+                      <div className="step-inner">
+                        <div className="step-direction-toggle" role="group" aria-label="Translate">
+                          <button type="button" className={`step-direction-option ${translateOption === "en-cn" ? "is-active" : ""}`} onClick={() => setTranslateOption("en-cn")}>en→cn</button>
+                          <button type="button" className={`step-direction-option ${translateOption === "cn-en" ? "is-active" : ""}`} onClick={() => setTranslateOption("cn-en")}>cn→en</button>
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="step-translate-translate"
+                      disabled={!transcribeText?.trim() || isTranslating}
+                      onClick={handleTranslate}
+                    >
+                      {isTranslating ? "translating…" : "translate"}
+                    </button>
+                    <button
+                      type="button"
+                      className="step-translate-download"
+                      disabled={!translateResult}
+                      onClick={() => {
+                        setDownloadSource("translation");
+                        setShowDownloadDialog(true);
+                      }}
+                    >
+                      download
+                    </button>
+                  </div>
+                </div>
+                <div className="step-body">
+                  {translateError && <p className="step-error" role="alert">{translateError}</p>}
+                  <textarea readOnly className="step-translate-result" rows={8} value={translateResult ?? ""} />
+                </div>
+              </section>
+            </div>
+
+            <div className="history-files">
+              <button type="button" className={`history-toggle${translateHistoryOpen ? " is-open" : ""}`} onClick={() => setTranslateHistoryOpen((o) => !o)}>
+                {translateHistoryOpen ? "Translation history ↑" : "Translation history ↓"}
+              </button>
+              {translateHistoryOpen && (
+                <ul className="history-list">
+                  {translateHistoryItems.length === 0 ? (
+                    <li className="history-list-empty">No translations yet</li>
+                  ) : (
+                    translateHistoryItems.map((translationItem) => (
+                      <li key={translationItem.id} className="history-item">
+                        <span
+                          className="history-item-name"
+                          title={translationItem.display_name}
+                        >
+                          {translationItem.display_name}
+                        </span>
+                        <span className="history-item-time">{formatCreatedAt(translationItem.created_at)}</span>
+                        <span className="history-item-actions">
+                          <button
+                            type="button"
+                            className="history-item-summarize"
+                            disabled={isSummarizing}
+                            title="summarize"
+                            onClick={() => setPendingSummarizeTranslationItem(translationItem)}
+                          >
+                            <img src={summarizeIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-preview"
+                            title="preview"
+                            onClick={async () => {
+                              setPreviewOpen(true);
+                              setPreviewTitle(stripDisplayNameExtension(translationItem.display_name));
+                              setPreviewText("");
+                              setPreviewLoading(true);
+                              try {
+                                const detail = await getTranslation(translationItem.id, { signal: apiAbortRef.current?.signal });
+                                setPreviewText(detail.text);
+                              } catch {
+                                setPreviewText("Failed to load.");
+                              } finally {
+                                setPreviewLoading(false);
+                              }
+                            }}
+                          >
+                            <img src={previewIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-download"
+                            title="download"
+                            onClick={() => {
+                              setPendingTranscriptionDownload(null);
+                              setPendingTranslationDownload(translationItem);
+                              setShowDownloadDialog(true);
+                            }}
+                          >
+                            <img src={downloadIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button type="button" className="history-item-delete" disabled={isSummarizing} title="delete" onClick={() => { setPendingDeleteTranscriptionItem(null); setPendingDeleteTranslationItem(translationItem); }}><img src={deleteIcon} alt="" width={24} height={24} /></button>
+                        </span>
+                      </li>
+                    ))
+                  )}
+                </ul>
+              )}
+            </div>
+
+            <div className="steps step-summarize">
+              <section className="step">
+                <div className="step-head">
+                  <span className="step-title">⑦    Summarize:</span>
+                  <div className="step-row">
+                    <div className="step-wrap">
+                      <p className="step-desc">Summarize the transcript and translation.</p>
+                      <div className="step-inner">
+                        <div className="step-source-toggle" role="group" aria-label="Summarize">
+                          <button type="button" className={`step-source-option ${summarizeSource === "all" ? "is-active" : ""}`} onClick={() => setSummarizeSource("all")}>all</button>
+                          <button type="button" className={`step-source-option ${summarizeSource === "transcript" ? "is-active" : ""}`} onClick={() => setSummarizeSource("transcript")}>Transcript</button>
+                          <button type="button" className={`step-source-option ${summarizeSource === "translation" ? "is-active" : ""}`} onClick={() => setSummarizeSource("translation")}>Translation</button>
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="step-summarize-summarize"
+                      disabled={(!transcribeText?.trim() && !translateResult?.trim()) || isSummarizing}
+                      onClick={handleSummarize}
+                    >
+                      {isSummarizing ? "summarizing…" : "summarize"}
+                    </button>
+                    <button
+                      type="button"
+                      className="step-summarize-download"
+                      disabled={!summarizeResult}
+                      onClick={() => {
+                        setDownloadSource("summary");
+                        setShowDownloadDialog(true);
+                      }}
+                    >
+                      download
+                    </button>
+                  </div>
+                </div>
+                <div className="step-body">
+                  {summarizeError && <p className="step-error" role="alert">{summarizeError}</p>}
+                  <textarea readOnly className="step-summarize-result" rows={8} value={summarizeResult ?? ""} />
+                </div>
+              </section>
+            </div>
+
+            <div className="history-files">
+              <button type="button" className={`history-toggle${summarizeHistoryOpen ? " is-open" : ""}`} onClick={() => setSummarizeHistoryOpen((o) => !o)}>
+                {summarizeHistoryOpen ? "Summary history ↑" : "Summary history ↓"}
+              </button>
+              {summarizeHistoryOpen && (
+                <ul className="history-list">
+                  {summarizeHistoryItems.length === 0 ? (
+                    <li className="history-list-empty">No summaries yet</li>
+                  ) : (
+                    summarizeHistoryItems.map((summaryItem) => (
+                      <li key={summaryItem.id} className="history-item">
+                        <span
+                          className="history-item-name"
+                          title={summaryItem.display_name}
+                        >
+                          {summaryItem.display_name}
+                        </span>
+                        <span className="history-item-time">{formatCreatedAt(summaryItem.created_at)}</span>
+                        <span className="history-item-actions">
+                          <button
+                            type="button"
+                            className="history-item-preview"
+                            title="preview"
+                            onClick={async () => {
+                              setPreviewOpen(true);
+                              setPreviewTitle(stripDisplayNameExtension(summaryItem.display_name));
+                              setPreviewText("");
+                              setPreviewLoading(true);
+                              try {
+                                const detail = await getSummary(summaryItem.id, { signal: apiAbortRef.current?.signal });
+                                setPreviewText(detail.text);
+                              } catch {
+                                setPreviewText("Failed to load.");
+                              } finally {
+                                setPreviewLoading(false);
+                              }
+                            }}
+                          >
+                            <img src={previewIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-download"
+                            title="download"
+                            onClick={() => {
+                              setPendingTranscriptionDownload(null);
+                              setPendingTranslationDownload(null);
+                              setPendingSummaryDownload(summaryItem);
+                              setShowDownloadDialog(true);
+                            }}
+                          >
+                            <img src={downloadIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-delete"
+                            title="delete"
+                            onClick={() => {
+                              setPendingDeleteTranscriptionItem(null);
+                              setPendingDeleteTranslationItem(null);
+                              setPendingDeleteSummaryItem(summaryItem);
+                            }}
+                          >
+                            <img src={deleteIcon} alt="" width={24} height={24} />
+                          </button>
+                        </span>
+                      </li>
+                    ))
+                  )}
+                </ul>
+              )}
+            </div>
+
+            <div className="steps step-restructure">
+              <section className="step">
+                <div className="step-head">
+                  <span className="step-title">⑧    Restructure:</span>
+                  <div className="step-row">
+                    <div className="step-wrap">
+                      <p className="step-desc">Restructure the transcript, translation and summary.</p>
+                      <div className="step-inner">
+                        <input
+                          type="text"
+                          id="step-restructure-input"
+                          name="result-file"
+                          className={`step-input${restructureResultFilesLabel ? " step-input-has-file" : ""}`}
+                          placeholder="Click to choose result files"
+                          aria-label="Selected result file names"
+                          value={restructureResultFilesLabel}
+                          title={restructureResultFilesLabel || undefined}
+                          readOnly
+                          onClick={() => setRestructureDialogOpen(true)}
+                        />
+                        {restructureSelectedCount > 0 && (
+                          <button
+                            type="button"
+                            className="step-upload-clear"
+                            onClick={() => {
+                              setRestructureSelectedTranscriptionIds([]);
+                              setRestructureSelectedTranslationIds([]);
+                              setRestructureSelectedSummaryIds([]);
+                              setRestructureResultFilesLabel("");
+                            }}
+                            aria-label="Clear selected result files"
+                          >
+                            ×
+                          </button>
+                        )}
+                        <span className="step-input-addon">
+                          {restructureSelectedCount > 0 ? (
+                            <>
+                              <span
+                                className={restructureSelectedCount >= 3 ? "step-input-addon-strong" : ""}
+                              >
+                                {restructureSelectedCount}
+                              </span>
+                              {"\u00A0files"}
+                            </>
+                          ) : (
+                            "files"
+                          )}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="step-restructure-restructure"
+                      disabled={
+                        isRestructuring ||
+                        restructureSelectedCount === 0 ||
+                        !restructureResultFilesLabel
+                      }
+                      onClick={handleRestructure}
+                    >
+                      restructure
+                    </button>
+                    <button
+                      type="button"
+                      className="step-restructure-download"
+                      disabled={!restructureResultText}
+                      onClick={() => {
+                        setDownloadSource("restructure");
+                        setShowDownloadDialog(true);
+                      }}
+                    >
+                      download
+                    </button>
+                  </div>
+                </div>
+                <div className="step-body">
+                  <textarea
+                    readOnly
+                    className="step-restructure-result"
+                    rows={8}
+                    value={restructureResultText}
+                  />
+                </div>
+              </section>
+            </div>
+
+            <div className="history-files">
+              <button
+                type="button"
+                className={`history-toggle${restructureHistoryOpen ? " is-open" : ""}`}
+                onClick={() => setRestructureHistoryOpen((o) => !o)}
+              >
+                {restructureHistoryOpen ? "Article history ↑" : "Article history ↓"}
+              </button>
+              {restructureHistoryOpen && (
+                <ul className="history-list">
+                  {restructureHistoryItems.length === 0 ? (
+                    <li className="history-list-empty">No articles yet</li>
+                  ) : (
+                    restructureHistoryItems.map((item) => (
+                      <li key={item.id} className="history-item">
+                        <span
+                          className="history-item-name"
+                          title={item.display_name}
+                        >
+                          {item.display_name}
+                        </span>
+                        <span className="history-item-time">
+                          {formatCreatedAt(item.created_at)}
+                        </span>
+                        <span className="history-item-actions">
+                          <button
+                            type="button"
+                            className="history-item-wechat"
+                            title="wechat"
+                          >
+                            <img src={wechatIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-wechat"
+                            title="notion"
+                          >
+                            <img src={notionIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-preview"
+                            title="preview"
+                            onClick={async () => {
+                              setPreviewOpen(true);
+                              setPreviewTitle(stripDisplayNameExtension(item.display_name));
+                              setPreviewText("");
+                              setPreviewLoading(true);
+                              try {
+                                const detail = await getArticle(item.id, { signal: apiAbortRef.current?.signal });
+                                setPreviewText(detail.text);
+                              } catch {
+                                setPreviewText("Failed to load.");
+                              } finally {
+                                setPreviewLoading(false);
+                              }
+                            }}
+                          >
+                            <img src={previewIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-download"
+                            title="download"
+                            onClick={() => {
+                              setPendingArticleDownload(item);
+                              setShowDownloadDialog(true);
+                            }}
+                          >
+                            <img src={downloadIcon} alt="" width={24} height={24} />
+                          </button>
+                          <button
+                            type="button"
+                            className="history-item-delete"
+                            title="delete"
+                            onClick={() => setPendingDeleteArticleItem(item)}
+                          >
+                            <img src={deleteIcon} alt="" width={24} height={24} />
+                          </button>
+                        </span>
+                      </li>
+                    ))
+                  )}
+                </ul>
+              )}
+            </div>
           </main>
         </div>
+        <footer className="footer">
+          <a href="https://www.lhjcjj.com" target="_blank" rel="noopener noreferrer" className="footer-link">
+            <img src="/logo-v2-porcelain3.png" alt="" className="footer-link-icon" width={12} height={12} />
+            www.lhjcjj.com
+          </a>
+        </footer>
       </div>
 
       {confirmCancelType !== null && (
@@ -1029,7 +2193,7 @@ export default function App() {
         </div>
       )}
 
-      {pendingDeleteItem !== null && (
+      {(pendingDeleteTranscriptionItem !== null || pendingDeleteTranslationItem !== null || pendingDeleteSummaryItem !== null || pendingDeleteArticleItem !== null) && (
         <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
           <div className="confirm-dialog">
             <p id="delete-confirm-title" className="confirm-text">Do you want to delete?</p>
@@ -1038,13 +2202,107 @@ export default function App() {
                 type="button"
                 className="confirm-btn confirm-btn-yes"
                 onClick={async () => {
-                  await handleHistoryDelete(pendingDeleteItem);
-                  setPendingDeleteItem(null);
+                  if (pendingDeleteTranscriptionItem !== null) {
+                    await handleDeleteTranscriptionItem(pendingDeleteTranscriptionItem);
+                    setPendingDeleteTranscriptionItem(null);
+                  }
+                  if (pendingDeleteTranslationItem !== null) {
+                    await handleDeleteTranslationItem(pendingDeleteTranslationItem);
+                    setPendingDeleteTranslationItem(null);
+                  }
+                  if (pendingDeleteSummaryItem !== null) {
+                    await handleDeleteSummaryItem(pendingDeleteSummaryItem);
+                    setPendingDeleteSummaryItem(null);
+                  }
+                  if (pendingDeleteArticleItem !== null) {
+                    await handleDeleteArticleItem(pendingDeleteArticleItem);
+                    setPendingDeleteArticleItem(null);
+                  }
                 }}
               >
                 Yes
               </button>
-              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPendingDeleteItem(null)}>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => { setPendingDeleteTranscriptionItem(null); setPendingDeleteTranslationItem(null); setPendingDeleteSummaryItem(null); setPendingDeleteArticleItem(null); }}>
+                No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {previewOpen && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="preview-dialog-title" onClick={() => setPreviewOpen(false)}>
+          <div className="confirm-dialog confirm-dialog-preview" onClick={(e) => e.stopPropagation()}>
+            <p id="preview-dialog-title" className="confirm-text">{previewTitle}</p>
+            <div className="preview-dialog-body">
+              {previewLoading ? (
+                <p className="preview-loading">Loading…</p>
+              ) : (
+                <textarea readOnly className="preview-textarea" rows={16} value={previewText} />
+              )}
+            </div>
+            <div className="confirm-actions" style={{ marginTop: 12 }}>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPreviewOpen(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingSummarizeTranscriptionItem !== null && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="summarize-confirm-title">
+          <div className="confirm-dialog">
+            <p id="summarize-confirm-title" className="confirm-text">Do you want to summarize the transcript?</p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-yes"
+                onClick={async () => {
+                  const item = pendingSummarizeTranscriptionItem;
+                  setPendingSummarizeTranscriptionItem(null);
+                  if (item) {
+                    await runSummarizeFromTranscriptionItem(item);
+                  }
+                }}
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-no"
+                onClick={() => setPendingSummarizeTranscriptionItem(null)}
+              >
+                No
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingSummarizeTranslationItem !== null && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="summarize-translation-confirm-title">
+          <div className="confirm-dialog">
+            <p id="summarize-translation-confirm-title" className="confirm-text">Do you want to summarize the translation?</p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-yes"
+                onClick={async () => {
+                  const item = pendingSummarizeTranslationItem;
+                  setPendingSummarizeTranslationItem(null);
+                  if (item) {
+                    await runSummarizeFromTranslationItem(item);
+                  }
+                }}
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-no"
+                onClick={() => setPendingSummarizeTranslationItem(null)}
+              >
                 No
               </button>
             </div>
@@ -1063,7 +2321,319 @@ export default function App() {
               <button type="button" className="confirm-btn confirm-btn-yes" onClick={() => handleDownloadDialogChoose("txt")}>
                 TXT
               </button>
-              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => { setShowDownloadDialog(false); setPendingHistoryDownload(null); }}>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-no"
+                onClick={() => {
+                  setShowDownloadDialog(false);
+                  setPendingTranscriptionDownload(null);
+                  setPendingTranslationDownload(null);
+                  setPendingSummaryDownload(null);
+                  setPendingArticleDownload(null);
+                  setDownloadSource(null);
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingTranslateFromHistoryItem !== null && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="translate-direction-dialog-title">
+          <div className="confirm-dialog">
+            <p id="translate-direction-dialog-title" className="confirm-text">Choose translation direction.</p>
+            <div className="confirm-actions">
+              <button type="button" className="confirm-btn confirm-btn-yes" onClick={() => handleTranslateDirectionChoose("en-cn")}>
+                en→cn
+              </button>
+              <button type="button" className="confirm-btn confirm-btn-yes" onClick={() => handleTranslateDirectionChoose("cn-en")}>
+                cn→en
+              </button>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPendingTranslateFromHistoryItem(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {restructureDialogOpen && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="restructure-dialog-title">
+          <div className="confirm-dialog confirm-dialog-restructure">
+            <p id="restructure-dialog-title" className="confirm-text">Choose result files (each type can have only one selected file).</p>
+            <div className="step-body" style={{ maxHeight: 360, minHeight: 0 }}>
+              <div
+                className="step-inner"
+                style={{ display: "flex", flexDirection: "row", gap: 12, height: "100%" }}
+              >
+                {/* Transcriptions column */}
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
+                  <strong
+                    style={{
+                      color: "var(--primary)",
+                      fontFamily: "Verdana, sans-serif",
+                      height: 24,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "100%",
+                    }}
+                  >
+                    Transcriptions
+                  </strong>
+                  {transcribeHistoryItems.length === 0 ? (
+                    <span
+                      className="history-list-empty"
+                      style={{ padding: 0, height: 24, display: "flex", alignItems: "center" }}
+                    >
+                      No transcripts yet
+                    </span>
+                  ) : (
+                    <div
+                      style={{
+                        maxHeight: 280,
+                        overflowY: "auto",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        padding: 0,
+                      }}
+                    >
+                      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                        {transcribeHistoryItems.map((item) => (
+                          <li
+                            key={item.id}
+                            className="history-item"
+                            style={{ borderBottom: "1px dotted var(--border)", paddingLeft: 12, paddingRight: 12 }}
+                          >
+                            <label
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                width: "100%",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                className="restructure-checkbox"
+                                style={{ marginRight: 8 }}
+                                checked={restructureSelectedTranscriptionIds.includes(item.id)}
+                                onChange={(e) =>
+                                  setRestructureSelectedTranscriptionIds((prev) =>
+                                    e.target.checked ? [item.id] : prev.filter((id) => id !== item.id),
+                                  )
+                                }
+                              />
+                              <span
+                                className="history-item-name"
+                                title={stripDisplayNameExtension(item.display_name)}
+                              >
+                                {stripDisplayNameExtension(item.display_name)}
+                              </span>
+                              <span className="history-item-time">
+                                {formatCreatedAt(item.created_at)}
+                              </span>
+                            </label>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                {/* Translations column */}
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
+                  <strong
+                    style={{
+                      color: "var(--primary)",
+                      fontFamily: "Verdana, sans-serif",
+                      height: 24,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "100%",
+                    }}
+                  >
+                    Translations
+                  </strong>
+                  {translateHistoryItems.length === 0 ? (
+                    <span
+                      className="history-list-empty"
+                      style={{ padding: 0, height: 24, display: "flex", alignItems: "center" }}
+                    >
+                      No translations yet
+                    </span>
+                  ) : (
+                    <div
+                      style={{
+                        maxHeight: 280,
+                        overflowY: "auto",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        padding: 0,
+                      }}
+                    >
+                      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                        {translateHistoryItems.map((item) => (
+                          <li
+                            key={item.id}
+                            className="history-item"
+                            style={{ borderBottom: "1px dotted var(--border)", paddingLeft: 12, paddingRight: 12 }}
+                          >
+                            <label
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                width: "100%",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                className="restructure-checkbox"
+                                style={{ marginRight: 8 }}
+                                checked={restructureSelectedTranslationIds.includes(item.id)}
+                                onChange={(e) =>
+                                  setRestructureSelectedTranslationIds((prev) =>
+                                    e.target.checked ? [item.id] : prev.filter((id) => id !== item.id),
+                                  )
+                                }
+                              />
+                              <span
+                                className="history-item-name"
+                                title={stripDisplayNameExtension(item.display_name)}
+                              >
+                                {stripDisplayNameExtension(item.display_name)}
+                              </span>
+                              <span className="history-item-time">
+                                {formatCreatedAt(item.created_at)}
+                              </span>
+                            </label>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+
+                {/* Summaries column */}
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
+                  <strong
+                    style={{
+                      color: "var(--primary)",
+                      fontFamily: "Verdana, sans-serif",
+                      height: 24,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "100%",
+                    }}
+                  >
+                    Summaries
+                  </strong>
+                  {summarizeHistoryItems.length === 0 ? (
+                    <span
+                      className="history-list-empty"
+                      style={{ padding: 0, height: 24, display: "flex", alignItems: "center" }}
+                    >
+                      No summaries yet
+                    </span>
+                  ) : (
+                    <div
+                      style={{
+                        maxHeight: 280,
+                        overflowY: "auto",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        padding: 0,
+                      }}
+                    >
+                      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                        {summarizeHistoryItems.map((item) => (
+                          <li
+                            key={item.id}
+                            className="history-item"
+                            style={{ borderBottom: "1px dotted var(--border)", paddingLeft: 12, paddingRight: 12 }}
+                          >
+                            <label
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                width: "100%",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                className="restructure-checkbox"
+                                style={{ marginRight: 8 }}
+                                checked={restructureSelectedSummaryIds.includes(item.id)}
+                                onChange={(e) =>
+                                  setRestructureSelectedSummaryIds((prev) => {
+                                    if (e.target.checked) {
+                                      if (prev.includes(item.id)) return prev;
+                                      if (prev.length >= 2) return prev; // max 2 summaries
+                                      return [...prev, item.id];
+                                    }
+                                    return prev.filter((id) => id !== item.id);
+                                  })
+                                }
+                              />
+                              <span
+                                className="history-item-name"
+                                title={stripDisplayNameExtension(item.display_name)}
+                              >
+                                {stripDisplayNameExtension(item.display_name)}
+                              </span>
+                              <span className="history-item-time">
+                                {formatCreatedAt(item.created_at)}
+                              </span>
+                            </label>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="confirm-actions" style={{ marginTop: 12 }}>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-yes"
+                onClick={() => {
+                  const names: string[] = [];
+                  if (restructureSelectedTranscriptionIds.length) {
+                    const item = transcribeHistoryItems.find(
+                      (x) => x.id === restructureSelectedTranscriptionIds[0],
+                    );
+                    if (item) names.push(stripDisplayNameExtension(item.display_name));
+                  }
+                  if (restructureSelectedTranslationIds.length) {
+                    const item = translateHistoryItems.find(
+                      (x) => x.id === restructureSelectedTranslationIds[0],
+                    );
+                    if (item) names.push(stripDisplayNameExtension(item.display_name));
+                  }
+                  if (restructureSelectedSummaryIds.length) {
+                    restructureSelectedSummaryIds.slice(0, 2).forEach((sid) => {
+                      const item = summarizeHistoryItems.find((x) => x.id === sid);
+                      if (item) names.push(stripDisplayNameExtension(item.display_name));
+                    });
+                  }
+                  setRestructureResultFilesLabel(names.join(", "));
+                  setRestructureDialogOpen(false);
+                }}
+              >
+                Confirm
+              </button>
+              <button
+                type="button"
+                className="confirm-btn confirm-btn-no"
+                onClick={() => setRestructureDialogOpen(false)}
+              >
                 Cancel
               </button>
             </div>

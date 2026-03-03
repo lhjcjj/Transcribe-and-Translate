@@ -51,7 +51,7 @@ export function useSplitFlow(
     splitResultRef.current = null;
   };
 
-  const doSplit = async () => {
+  const split = async () => {
     if (!uploadId) return;
     const controller = new AbortController();
     splitAbortRef.current = controller;
@@ -97,5 +97,5 @@ export function useSplitFlow(
     }
   };
 
-  return { doSplit, isSplitting, splitProgress, splitAbortRef };
+  return { split, isSplitting, splitProgress, splitAbortRef };
 }

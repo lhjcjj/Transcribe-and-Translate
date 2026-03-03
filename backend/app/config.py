@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 # Load backend/.env so project-only vars (e.g. TRANSCRIBE_ENGINE) can be set without system env
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+# KMP_DUPLICATE_LIB_OK and OMP_NUM_THREADS are set in run.sh before starting Python (avoids libiomp5 crash on macOS).
+
 
 def _str_list(value: str | None) -> list[str]:
     if not value or not value.strip():
@@ -54,7 +56,7 @@ TRANSCRIBE_MAX_BATCH_SIZE = max(1, int(os.environ.get("TRANSCRIBE_MAX_BATCH_SIZE
 # Max retries for transcription API on connection errors.
 TRANSCRIBE_MAX_RETRIES = max(1, int(os.environ.get("TRANSCRIBE_MAX_RETRIES", "3")))
 
-# Transcription engine: "openai" (Whisper API) or "faster_whisper" (local).
+# Transcription engine: "api" (remote Whisper API, e.g. OpenAI) or "faster_whisper" (local).
 TRANSCRIBE_ENGINE = (os.environ.get("TRANSCRIBE_ENGINE") or "faster_whisper").strip().lower()
 # faster_whisper only: model name (e.g. base, small, medium) and device (cpu, cuda, etc.).
 FASTER_WHISPER_MODEL = (os.environ.get("FASTER_WHISPER_MODEL") or "base").strip().lower()
@@ -74,4 +76,11 @@ OPENAI_API_BASE = os.environ.get("GPTS_API_BASE") or os.environ.get("OPENAI_API_
 
 # Translation: optional separate key; can use same OPENAI_API_KEY
 TRANSLATE_API_KEY = os.environ.get("GPTS_API_KEY") or os.environ.get("OPENAI_API_KEY")
-TRANSLATE_PROVIDER = (os.environ.get("TRANSLATE_PROVIDER") or "openai").strip().lower()
+TRANSLATE_PROVIDER = (os.environ.get("TRANSLATE_PROVIDER") or "api").strip().lower()
+
+# Local translation: Qwen model directory (used when engine='local'). Defaults to repo models path.
+QWEN_MODEL_DIR = (
+    os.environ.get("QWEN_MODEL_DIR")
+    or (Path(__file__).resolve().parent.parent / "models" / "qwen2-1_5b-instruct").as_posix()
+)
+

@@ -1,5 +1,6 @@
 from .transcribe import TranscribeResponse
 from .translate import TranslateRequest, TranslateResponse
+from .summarize import SummarizeRequest, SummarizeResponse
 from .upload import SplitRequest, SplitResponse, UploadChunkItem, UploadResponse
 
 __all__ = [
@@ -10,4 +11,6 @@ __all__ = [
     "TranscribeResponse",
     "TranslateRequest",
     "TranslateResponse",
+    "SummarizeRequest",
+    "SummarizeResponse",
 ]

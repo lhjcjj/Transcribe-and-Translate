@@ -1,20 +1,25 @@
-"""Translation via OpenAI or configurable provider."""
+"""Translation: remote API (engine=api, e.g. OpenAI) or local Qwen (engine=local)."""
+from __future__ import annotations
+
 from openai import OpenAI
 
-from app.config import TRANSLATE_API_KEY, TRANSLATE_PROVIDER, OPENAI_API_BASE
+from app.config import OPENAI_API_BASE, TRANSLATE_API_KEY, TRANSLATE_PROVIDER
+from app.services import translate_qwen
 
 
-def translate_text(text: str, target_lang: str) -> str:
+def translate_text(text: str, target_lang: str, engine: str = "api") -> str:
     """
     Translate text to target language.
-    Uses OpenAI chat completion by default. Raises ValueError if not configured.
+    engine: "api" -> remote API (currently OpenAI). "local" -> local Qwen model (with internal chunking).
     """
+    if engine == "local":
+        return translate_qwen.translate_qwen_long(text, target_lang)
+
     if not TRANSLATE_API_KEY:
         raise ValueError("Translation API key not configured (set OPENAI_API_KEY or TRANSLATE_API_KEY)")
 
-    if TRANSLATE_PROVIDER != "openai":
-        # Placeholder for future Aliyun or other provider
-        raise ValueError(f"Translation provider '{TRANSLATE_PROVIDER}' not implemented; use 'openai'")
+    if TRANSLATE_PROVIDER != "api":
+        raise ValueError(f"Translation provider '{TRANSLATE_PROVIDER}' not implemented; use 'api'")
 
     client_kw: dict = {"api_key": TRANSLATE_API_KEY}
     if OPENAI_API_BASE:

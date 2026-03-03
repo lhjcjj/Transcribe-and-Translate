@@ -262,7 +262,7 @@ export interface TranscribeApiResult {
   failed_chunk_indices?: number[] | null;
 }
 
-export type TranscribeEngine = "openai" | "faster_whisper";
+export type TranscribeEngine = "api" | "faster_whisper";
 
 export async function transcribe(
   file: File,
@@ -391,6 +391,7 @@ export interface TranscriptionListItem {
 export interface TranscriptionDetail {
   id: string;
   created_at: number | null;
+  display_name: string;
   text: string;
   meta: Record<string, unknown> | null;
 }
@@ -439,4 +440,282 @@ export async function deleteTranscription(
   if (!res.ok && res.status !== 404) {
     throw new Error(await getErrorMessageFromResponse(res, "Delete transcription failed"));
   }
+}
+
+export interface TranslateResponse {
+  text: string;
+}
+
+/** Translation history list item (metadata only). */
+export interface TranslationListItem {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+}
+
+/** Full translation for get/download. */
+export interface TranslationDetail {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+  text: string;
+  meta?: Record<string, unknown> | null;
+}
+
+export async function saveTranslation(
+  displayName: string,
+  text: string,
+  options?: { signal?: AbortSignal }
+): Promise<TranslationListItem> {
+  const res = await jsonPost(
+    `${API_BASE}/api/translations`,
+    { display_name: displayName, text },
+    options
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Save translation failed"));
+  }
+  return res.json();
+}
+
+export async function listTranslations(
+  options?: { limit?: number; offset?: number; signal?: AbortSignal }
+): Promise<TranslationListItem[]> {
+  const limit = options?.limit ?? 50;
+  const offset = options?.offset ?? 0;
+  const res = await fetch(
+    `${API_BASE}/api/translations?limit=${Math.min(100, Math.max(1, limit))}&offset=${Math.max(0, offset)}`,
+    {
+      headers: getApiHeaders(),
+      signal: options?.signal,
+    }
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "List translations failed"));
+  }
+  return res.json();
+}
+
+export async function getTranslation(
+  translationId: string,
+  options?: { signal?: AbortSignal }
+): Promise<TranslationDetail> {
+  const res = await fetch(`${API_BASE}/api/translations/${encodeURIComponent(translationId)}`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Get translation failed"));
+  }
+  return res.json();
+}
+
+export async function deleteTranslation(
+  translationId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/translations/${encodeURIComponent(translationId)}`, {
+    method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await getErrorMessageFromResponse(res, "Delete translation failed"));
+  }
+}
+
+/** Summary history list item (metadata only). */
+export interface SummaryListItem {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+}
+
+/** Full summary for get/download. */
+export interface SummaryDetail {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+  text: string;
+  meta?: Record<string, unknown> | null;
+}
+
+export async function saveSummary(
+  displayName: string,
+  text: string,
+  options?: { signal?: AbortSignal }
+): Promise<SummaryListItem> {
+  const res = await jsonPost(
+    `${API_BASE}/api/summaries`,
+    { display_name: displayName, text },
+    options
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Save summary failed"));
+  }
+  return res.json();
+}
+
+export async function listSummaries(
+  options?: { limit?: number; offset?: number; signal?: AbortSignal }
+): Promise<SummaryListItem[]> {
+  const limit = options?.limit ?? 50;
+  const offset = options?.offset ?? 0;
+  const res = await fetch(
+    `${API_BASE}/api/summaries?limit=${Math.min(100, Math.max(1, limit))}&offset=${Math.max(0, offset)}`,
+    { headers: getApiHeaders(), signal: options?.signal }
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "List summaries failed"));
+  }
+  return res.json();
+}
+
+export async function getSummary(
+  summaryId: string,
+  options?: { signal?: AbortSignal }
+): Promise<SummaryDetail> {
+  const res = await fetch(`${API_BASE}/api/summaries/${encodeURIComponent(summaryId)}`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Get summary failed"));
+  }
+  return res.json();
+}
+
+export async function deleteSummary(
+  summaryId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/summaries/${encodeURIComponent(summaryId)}`, {
+    method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await getErrorMessageFromResponse(res, "Delete summary failed"));
+  }
+}
+
+/** Restructured article history list item (metadata only). */
+export interface ArticleListItem {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+}
+
+/** Full restructured article for get/download. */
+export interface ArticleDetail {
+  id: string;
+  created_at: number | null;
+  display_name: string;
+  text: string;
+}
+
+export async function saveArticle(
+  displayName: string,
+  text: string,
+  options?: { signal?: AbortSignal }
+): Promise<ArticleListItem> {
+  const res = await jsonPost(
+    `${API_BASE}/api/articles`,
+    { display_name: displayName, text },
+    options
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Save article failed"));
+  }
+  return res.json();
+}
+
+export async function listArticles(
+  options?: { limit?: number; offset?: number; signal?: AbortSignal }
+): Promise<ArticleListItem[]> {
+  const limit = options?.limit ?? 50;
+  const offset = options?.offset ?? 0;
+  const res = await fetch(
+    `${API_BASE}/api/articles?limit=${Math.min(100, Math.max(1, limit))}&offset=${Math.max(0, offset)}`,
+    { headers: getApiHeaders(), signal: options?.signal }
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "List articles failed"));
+  }
+  return res.json();
+}
+
+export async function getArticle(
+  articleId: string,
+  options?: { signal?: AbortSignal }
+): Promise<ArticleDetail> {
+  const res = await fetch(`${API_BASE}/api/articles/${encodeURIComponent(articleId)}`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Get article failed"));
+  }
+  return res.json();
+}
+
+export async function deleteArticle(
+  articleId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/articles/${encodeURIComponent(articleId)}`, {
+    method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(await getErrorMessageFromResponse(res, "Delete article failed"));
+  }
+}
+
+export interface SummarizeResponse {
+  text: string;
+}
+
+export type SummarizeEngine = "api" | "local";
+
+export async function summarize(
+  text: string,
+  options?: { signal?: AbortSignal; engine?: SummarizeEngine }
+): Promise<SummarizeResponse> {
+  const body: { text: string; engine?: SummarizeEngine } = { text };
+  if (options?.engine !== undefined) body.engine = options.engine;
+  const res = await jsonPost(
+    `${API_BASE}/api/summarize`,
+    body,
+    { signal: options?.signal }
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Summary failed"));
+  }
+  return res.json();
+}
+
+export type TranslateEngine = "api" | "local";
+
+export async function translate(
+  text: string,
+  targetLang: string,
+  options?: { signal?: AbortSignal; engine?: TranslateEngine }
+): Promise<TranslateResponse> {
+  const body: { text: string; target_lang: string; engine?: TranslateEngine } = {
+    text,
+    target_lang: targetLang,
+  };
+  if (options?.engine !== undefined) body.engine = options.engine;
+  const res = await fetch(`${API_BASE}/api/translate`, {
+    method: "POST",
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Translation failed"));
+  }
+  return res.json();
 }

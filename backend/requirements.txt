@@ -1,9 +1,21 @@
+# Core API
 python-dotenv>=1.0.0
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.6
 openai>=1.12.0
 pydantic>=2.0.0
+
+# Audio & transcription
 pydub>=0.25.1
-audioop-lts>=0.2.0; python_version >= "3.13"  # only on 3.13+ (audioop removed from stdlib); 3.12 has built-in audioop
-faster-whisper  # optional: for local transcription (use Python 3.12; 3.13 has dependency issues)
+audioop-lts>=0.2.0; python_version >= "3.13"
+faster-whisper  # optional: local transcription (Python 3.12 recommended)
+
+# Local translation (Qwen). Omit if you only use API translation.
+numpy<2
+torch>=2.1.0,<3.0.0
+transformers>=4.36.0,<5.0.0
+sentencepiece>=0.1.99
+accelerate>=0.26.0
+safetensors>=0.4.0
+huggingface_hub>=0.26.0

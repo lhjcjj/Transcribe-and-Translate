@@ -29,3 +29,9 @@ npm-debug.log*
 
 # Build / docker
 *.log
+
+# Runtime data (transcriptions, translations, summaries, articles, etc.)
+backend/data/
+
+# Local models (Qwen, etc.)
+backend/models/

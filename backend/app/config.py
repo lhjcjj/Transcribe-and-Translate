@@ -70,17 +70,58 @@ ALLOWED_ORIGINS: list[str] = _str_list(
     os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000")
 )
 
-# Transcription (e.g. OpenAI Whisper). Key not defaulted.
-TRANSCRIBE_API_KEY = os.environ.get("GPTS_API_KEY") or os.environ.get("OPENAI_API_KEY")
+# Transcription (e.g. OpenAI Whisper): optional separate key/base; falls back to GPTS/OPENAI when unset
+TRANSCRIBE_API_KEY = (
+    os.environ.get("TRANSCRIBE_API_KEY")
+    or os.environ.get("GPTS_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+)
+TRANSCRIBE_API_BASE = (
+    os.environ.get("TRANSCRIBE_API_BASE")
+    or os.environ.get("GPTS_API_BASE")
+    or os.environ.get("OPENAI_API_BASE")
+)
 OPENAI_API_BASE = os.environ.get("GPTS_API_BASE") or os.environ.get("OPENAI_API_BASE")
 
-# Translation: optional separate key; can use same OPENAI_API_KEY
-TRANSLATE_API_KEY = os.environ.get("GPTS_API_KEY") or os.environ.get("OPENAI_API_KEY")
+# Translation: optional separate key/base; falls back to GPTS/OPENAI when unset
+TRANSLATE_API_KEY = (
+    os.environ.get("TRANSLATE_API_KEY")
+    or os.environ.get("GPTS_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+)
+TRANSLATE_API_BASE = (
+    os.environ.get("TRANSLATE_API_BASE")
+    or os.environ.get("GPTS_API_BASE")
+    or os.environ.get("OPENAI_API_BASE")
+)
+# Translation provider when engine=api: only "api" (OpenAI-compatible) is implemented; reserved for future providers.
 TRANSLATE_PROVIDER = (os.environ.get("TRANSLATE_PROVIDER") or "api").strip().lower()
+
+# Summarization (API engine): optional separate key/base; falls back to translate key/base when unset
+SUMMARIZE_API_KEY = (
+    os.environ.get("SUMMARIZE_API_KEY")
+    or os.environ.get("GPTS_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+)
+SUMMARIZE_API_BASE = (
+    os.environ.get("SUMMARIZE_API_BASE")
+    or os.environ.get("GPTS_API_BASE")
+    or os.environ.get("OPENAI_API_BASE")
+)
 
 # Local translation: Qwen model directory (used when engine='local'). Defaults to repo models path.
 QWEN_MODEL_DIR = (
     os.environ.get("QWEN_MODEL_DIR")
     or (Path(__file__).resolve().parent.parent / "models" / "qwen2-1_5b-instruct").as_posix()
 )
+
+# Notion integration (optional): integration token and target database ids
+NOTION_API_TOKEN = (os.environ.get("NOTION_API_TOKEN") or os.environ.get("NOTION_INTEGRATION_TOKEN") or "").strip()
+# Backwards compatibility: if NOTION_DATABASE_ID_MAIN is not set, fall back to NOTION_DATABASE_ID
+NOTION_DATABASE_ID_MAIN = (
+    os.environ.get("NOTION_DATABASE_ID_MAIN") or os.environ.get("NOTION_DATABASE_ID") or ""
+).strip()
+NOTION_DATABASE_ID_ALT = (os.environ.get("NOTION_DATABASE_ID_ALT") or "").strip()
+
+NOTION_MENTION_USER_ID = (os.environ.get("NOTION_MENTION_USER_ID") or "").strip()
 

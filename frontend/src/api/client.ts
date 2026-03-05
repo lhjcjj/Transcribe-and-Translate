@@ -277,7 +277,7 @@ export async function transcribe(
   if (options?.displayName != null && options.displayName.trim() !== "") {
     form.append("display_name", options.displayName.trim());
   }
-  if (options?.engine != null && options.engine !== "") {
+  if (options?.engine != null) {
     form.append("engine", options.engine);
   }
   const res = await fetch(`${API_BASE}/api/transcribe`, {
@@ -309,7 +309,7 @@ export async function transcribeByUploadIdsStream(
   if (options?.displayName != null && options.displayName.trim() !== "") {
     form.append("display_name", options.displayName.trim());
   }
-  if (options?.engine != null && options.engine !== "") {
+  if (options?.engine != null) {
     form.append("engine", options.engine);
   }
   const res = await fetch(`${API_BASE}/api/transcribe/stream`, {
@@ -604,6 +604,7 @@ export interface ArticleListItem {
   id: string;
   created_at: number | null;
   display_name: string;
+  notion_url?: string | null;
 }
 
 /** Full restructured article for get/download. */
@@ -612,6 +613,7 @@ export interface ArticleDetail {
   created_at: number | null;
   display_name: string;
   text: string;
+  notion_url?: string | null;
 }
 
 export async function saveArticle(
@@ -673,6 +675,29 @@ export async function deleteArticle(
   }
 }
 
+export interface ArticleNotionExportResponse {
+  notion_page_id: string | null;
+  notion_url: string | null;
+}
+
+export type NotionDatabaseKey = "main" | "alt";
+
+export async function exportArticleToNotion(
+  articleId: string,
+  database: NotionDatabaseKey,
+  options?: { signal?: AbortSignal }
+): Promise<ArticleNotionExportResponse> {
+  const res = await jsonPost(
+    `${API_BASE}/api/articles/${encodeURIComponent(articleId)}/notion`,
+    { database },
+    options
+  );
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Export article to Notion failed"));
+  }
+  return res.json();
+}
+
 export interface SummarizeResponse {
   text: string;
 }
@@ -699,14 +724,18 @@ export async function summarize(
 export type TranslateEngine = "api" | "local";
 
 export async function translate(
-  text: string,
+  textOrSegments: string | string[],
   targetLang: string,
   options?: { signal?: AbortSignal; engine?: TranslateEngine }
 ): Promise<TranslateResponse> {
-  const body: { text: string; target_lang: string; engine?: TranslateEngine } = {
-    text,
+  const body: { text?: string; segments?: string[]; target_lang: string; engine?: TranslateEngine } = {
     target_lang: targetLang,
   };
+  if (Array.isArray(textOrSegments)) {
+    body.segments = textOrSegments;
+  } else {
+    body.text = textOrSegments;
+  }
   if (options?.engine !== undefined) body.engine = options.engine;
   const res = await fetch(`${API_BASE}/api/translate`, {
     method: "POST",
@@ -718,4 +747,155 @@ export async function translate(
     throw new Error(await getErrorMessageFromResponse(res, "Translation failed"));
   }
   return res.json();
+}
+
+export interface PodcastRssResponse {
+  feedUrl: string;
+}
+
+export interface PodcastFeedAudioItem {
+  url: string;
+  title?: string | null;
+  pub_date?: string | null;
+}
+
+export async function getPodcastFeedAudioLinks(
+  feedUrl: string,
+  options?: { signal?: AbortSignal }
+): Promise<PodcastFeedAudioItem[]> {
+  const res = await fetch(
+    `${API_BASE}/api/podcast/feed/audio-links?${new URLSearchParams({ feed_url: feedUrl }).toString()}`,
+    {
+      headers: getApiHeaders(),
+      signal: options?.signal,
+    }
+  );
+  if (!res.ok) {
+    const msg = await getErrorMessageFromResponse(res, "Fetch audio links failed");
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+export async function getPodcastRss(
+  link: string,
+  options?: { signal?: AbortSignal }
+): Promise<PodcastRssResponse> {
+  const url = `${API_BASE}/api/podcast/rss?${new URLSearchParams({ link: link.trim() }).toString()}`;
+  const res = await fetch(url, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    const msg = await getErrorMessageFromResponse(res, "Get RSS failed");
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+export function downloadPodcastEpisodeAudio(audioUrl: string, filename: string): void {
+  const url = `${API_BASE}/api/podcast/download?${new URLSearchParams({
+    url: audioUrl,
+    filename,
+  }).toString()}`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+export interface PodcastListItem {
+  id: string;
+  created_at: number | null;
+  name: string;
+  link: string;
+  rss: string | null;
+}
+
+export interface PodcastSaveResponse {
+  id: string;
+  created_at: number | null;
+  name: string;
+  link: string;
+  rss: string | null;
+}
+
+export async function listPodcasts(options?: { signal?: AbortSignal }): Promise<PodcastListItem[]> {
+  const res = await fetch(`${API_BASE}/api/podcasts?limit=100&offset=0`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "List podcasts failed"));
+  }
+  return res.json();
+}
+
+export async function savePodcast(
+  name: string,
+  link: string,
+  options?: { signal?: AbortSignal }
+): Promise<PodcastSaveResponse> {
+  const res = await fetch(`${API_BASE}/api/podcasts`, {
+    method: "POST",
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name.trim(), link: link.trim() }),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Save podcast failed"));
+  }
+  return res.json();
+}
+
+export async function updatePodcast(
+  podcastId: string,
+  name: string,
+  link: string,
+  options?: { signal?: AbortSignal }
+): Promise<PodcastSaveResponse> {
+  const res = await fetch(`${API_BASE}/api/podcasts/${encodeURIComponent(podcastId)}`, {
+    method: "PUT",
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name.trim(), link: link.trim() }),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Update podcast failed"));
+  }
+  return res.json();
+}
+
+export async function updatePodcastRss(
+  podcastId: string,
+  rss: string,
+  options?: { signal?: AbortSignal }
+): Promise<PodcastListItem> {
+  const res = await fetch(`${API_BASE}/api/podcasts/${encodeURIComponent(podcastId)}`, {
+    method: "PATCH",
+    headers: { ...getApiHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ rss }),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Update podcast RSS failed"));
+  }
+  return res.json();
+}
+
+export async function deletePodcast(
+  podcastId: string,
+  options?: { signal?: AbortSignal }
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/podcasts/${encodeURIComponent(podcastId)}`, {
+    method: "DELETE",
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Delete podcast failed"));
+  }
 }

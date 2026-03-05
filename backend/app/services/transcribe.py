@@ -7,7 +7,7 @@ from openai import APIConnectionError, OpenAI
 from httpx import ReadError
 
 from app.config import (
-    OPENAI_API_BASE,
+    TRANSCRIBE_API_BASE,
     TRANSCRIBE_API_KEY,
     TRANSCRIBE_ENGINE,
     TRANSCRIBE_MAX_CONCURRENT,
@@ -43,7 +43,7 @@ def transcribe_audio(
         if effective_engine == "api":
             if not TRANSCRIBE_API_KEY:
                 raise ValueError(
-                    "Transcription API key not configured (set OPENAI_API_KEY or TRANSCRIBE_API_KEY)"
+                    "Transcription API key not configured (set TRANSCRIBE_API_KEY, OPENAI_API_KEY, or GPTS_API_KEY)"
                 )
             return _transcribe_audio_openai(audio_bytes, filename, language, clean_up)
         from app.services import transcribe_whisper as whisper_svc
@@ -60,8 +60,8 @@ def _transcribe_audio_openai(
 ) -> str:
     """OpenAI Whisper API implementation (called while holding _transcribe_semaphore)."""
     client_kw: dict = {"api_key": TRANSCRIBE_API_KEY}
-    if OPENAI_API_BASE:
-        client_kw["base_url"] = OPENAI_API_BASE
+    if TRANSCRIBE_API_BASE:
+        client_kw["base_url"] = TRANSCRIBE_API_BASE
     client = OpenAI(**client_kw)
 
     name = filename or "audio"

@@ -86,6 +86,7 @@ def list_articles(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
                 "id": aid,
                 "created_at": data.get("created_at"),
                 "display_name": (data.get("display_name") or "").strip() or f"Article {aid[:8]}",
+                "notion_url": (data.get("notion_url") or "").strip() or None,
             }
         )
     return out
@@ -111,7 +112,33 @@ def get_article(article_id: str) -> dict[str, Any] | None:
         "created_at": data.get("created_at"),
         "display_name": (data.get("display_name") or "").strip() or f"Article {article_id[:8]}",
         "text": data.get("text", ""),
+        "notion_url": (data.get("notion_url") or "").strip() or None,
     }
+
+
+def update_article_notion(article_id: str, notion_url: str | None, notion_page_id: str | None = None) -> bool:
+    """Update an article's last-pushed Notion URL (and optional page id). Returns True if updated."""
+    try:
+        _validate_id(article_id)
+    except ValueError:
+        return False
+    path = _HISTORY_DIR / f"{article_id.strip()}.json"
+    if not path.is_file():
+        return False
+    with _lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(data, dict) or "text" not in data:
+            return False
+        data["notion_url"] = (notion_url or "").strip() or None
+        data["notion_page_id"] = (notion_page_id or "").strip() or None
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            return False
+    return True
 
 
 def delete_article(article_id: str) -> bool:

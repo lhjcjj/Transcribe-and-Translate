@@ -11,6 +11,13 @@ import {
   getSummary,
   getTranscription,
   getTranslation,
+  deletePodcast,
+  getPodcastFeedAudioLinks,
+  getPodcastRss,
+  listPodcasts,
+  savePodcast,
+  updatePodcast,
+  updatePodcastRss,
   getUploadConfig,
   getUploadDuration,
   listSummaries,
@@ -31,14 +38,22 @@ import {
   TranslationListItem,
   SummaryListItem,
   ArticleListItem,
+  exportArticleToNotion,
+  downloadPodcastEpisodeAudio,
 } from "./api/client";
 import deleteIcon from "./assets/icons/delete-icon.svg";
 import downloadIcon from "./assets/icons/download-icon.svg";
+import splitIcon from "./assets/icons/split-icon.svg";
+import transcribeIcon from "./assets/icons/transcribe-icon.svg";
 import summarizeIcon from "./assets/icons/summarize-icon.svg";
 import translateIcon from "./assets/icons/translate-icon.svg";
-import wechatIcon from "./assets/icons/wechat-icon.svg";
 import notionIcon from "./assets/icons/notion-icon.svg";
+import podcastsIcon from "./assets/icons/podcasts-icon.svg";
+import addIcon from "./assets/icons/add-icon.svg";
+import editIcon from "./assets/icons/edit-icon.svg";
+import saveIcon from "./assets/icons/save-icon.svg";
 import previewIcon from "./assets/icons/preview-icon.svg";
+import rssIcon from "./assets/icons/rss-icon.svg";
 import { FileUpload } from "./components/FileUpload";
 import { TranscribeResult } from "./components/TranscribeResult";
 import { useSplitFlow } from "./hooks/useSplitFlow";
@@ -62,6 +77,12 @@ const CHUNK_SIZE_DEBOUNCE_MS = 300;
 
 /** Delay (ms) before revoking download blob URL so the browser can start the download. */
 const DOWNLOAD_REVOKE_DELAY_MS = 200;
+
+/** Log error message; in dev only also log detail to avoid leaking in production. */
+function reportError(message: string, err?: unknown): void {
+  console.error(message);
+  if (import.meta.env.DEV && err != null) console.error(err);
+}
 
 async function deleteUploadIds(
   ids: string[] | null,
@@ -107,10 +128,32 @@ function formatCreatedAt(createdAt: number | null): string {
   return `${y}-${mo}-${day} ${h}:${min}:${s}`;
 }
 
+/** Format RSS/ISO pub_date string as yyyy-mm-dd hh:mm:ss. Returns "-" if null/empty or unparseable. */
+function formatPubDate(pubDate: string | null | undefined): string {
+  if (pubDate == null || String(pubDate).trim() === "") return "-";
+  const d = new Date(pubDate);
+  if (Number.isNaN(d.getTime())) return "-";
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  const s = String(d.getSeconds()).padStart(2, "0");
+  return `${y}-${mo}-${day} ${h}:${min}:${s}`;
+}
+
 /** Remove common audio/file extensions from display name (e.g. .mp3, .wav). */
 function stripDisplayNameExtension(name: string): string {
   if (!name || typeof name !== "string") return name;
   return name.replace(/\.(mp3|wav|m4a|flac|ogg|webm|mp4|aac|opus|wma)$/i, "");
+}
+
+/** Suggested filename for podcast episode download: sanitized title + extension from URL. */
+function podcastEpisodeDownloadName(title: string | null | undefined, url: string): string {
+  const base = (title || "episode").trim().replace(/[/\\:*?"<>|]/g, "_").slice(0, 120) || "episode";
+  const pathname = url.split("?")[0];
+  const ext = pathname.includes(".") ? pathname.slice(pathname.lastIndexOf(".")) : ".mp3";
+  return `${base}${ext}`;
 }
 
 /** True if string contains CJK or other characters not in Helvetica's repertoire (e.g. Chinese). */
@@ -259,6 +302,7 @@ export default function App() {
   const transcribeAbortRef = useRef<AbortController | null>(null);
   const uploadGenerationRef = useRef(0);
   const downloadRevokeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelSplitDelayTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [maxUploadBytes, setMaxUploadBytes] = useState<number | null>(null);
   /** Local vs API: applies to translation and summarize; transcribe always uses local for now. */
   const [selectedEngine, setSelectedEngine] = useState<"local" | "api">("api");
@@ -282,6 +326,28 @@ export default function App() {
   const [pendingArticleDownload, setPendingArticleDownload] = useState<ArticleListItem | null>(null);
   /** Restructure history: list from API (articles). */
   const [restructureHistoryItems, setRestructureHistoryItems] = useState<ArticleListItem[]>([]);
+  /** Sub-nav active tab: which item has sub-nav-active class. */
+  const [subNavActive, setSubNavActive] = useState<"home" | "get-info" | "transcribe">("get-info");
+  type PodcastRow = { id: string; name: string; link: string; rss?: string | null; inputsDisabled: boolean; showValidationError: boolean };
+  const [podcastRows, setPodcastRows] = useState<PodcastRow[]>([{ id: "new-0", name: "", link: "", inputsDisabled: false, showValidationError: false }]);
+  useEffect(() => {
+    if (subNavActive !== "get-info") return;
+    listPodcasts()
+      .then((items) => {
+        if (items.length === 0) return;
+        setPodcastRows(
+          items.map((p) => ({
+            id: p.id,
+            name: p.name,
+            link: p.link,
+            rss: p.rss ?? undefined,
+            inputsDisabled: true,
+            showValidationError: false,
+          }))
+        );
+      })
+      .catch(() => {});
+  }, [subNavActive]);
   /** When set, show "Choose translation direction." dialog for this transcription history item. */
   const [pendingTranslateFromHistoryItem, setPendingTranslateFromHistoryItem] = useState<TranscriptionListItem | null>(null);
   const [pendingSummarizeTranscriptionItem, setPendingSummarizeTranscriptionItem] = useState<TranscriptionListItem | null>(null);
@@ -298,6 +364,11 @@ export default function App() {
   const [previewTitle, setPreviewTitle] = useState("");
   const [previewText, setPreviewText] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [podcastPreviewOpen, setPodcastPreviewOpen] = useState(false);
+  const [podcastPreviewLoading, setPodcastPreviewLoading] = useState(false);
+  const [podcastPreviewLinks, setPodcastPreviewLinks] = useState<{ url: string; title?: string | null; pub_date?: string | null }[]>([]);
+  const [podcastPreviewSelectedIndices, setPodcastPreviewSelectedIndices] = useState<number[]>([]);
+  const [pendingNotionArticleItem, setPendingNotionArticleItem] = useState<ArticleListItem | null>(null);
 
   // If this component ever calls translate(), pass apiAbortRef.current?.signal so the request is aborted on unmount.
   useEffect(() => {
@@ -309,6 +380,7 @@ export default function App() {
       durationAbortRef.current?.abort();
       transcribeAbortRef.current?.abort();
       if (downloadRevokeTimeoutRef.current) clearTimeout(downloadRevokeTimeoutRef.current);
+      if (cancelSplitDelayTimeoutRef.current) clearTimeout(cancelSplitDelayTimeoutRef.current);
     };
   }, []);
 
@@ -383,9 +455,7 @@ export default function App() {
       .catch((err) => {
         // Ignore aborts (React strict mode mounts/unmounts effects).
         if (err instanceof DOMException && err.name === "AbortError") return;
-        console.error("Failed to load upload config");
-        // Only in dev; production build does not expose stack.
-        if (import.meta.env.DEV && err) console.error(err);
+        reportError("Failed to load upload config", err);
       })
       .finally(() => {
         configAbortRef.current = null;
@@ -396,7 +466,7 @@ export default function App() {
     () =>
       Math.max(
         CHUNK_SIZE_MIN,
-        Math.min(CHUNK_SIZE_MAX, parseInt(chunkSizeDebounced, 10) || 5)
+        Math.min(CHUNK_SIZE_MAX, parseInt(chunkSizeDebounced, 10) || 3)
       ),
     [chunkSizeDebounced]
   );
@@ -598,15 +668,18 @@ export default function App() {
         try {
           await cancelSplitStream({ signal: apiAbortRef.current?.signal ?? undefined });
         } catch (err) {
-          console.error("Cancel split request failed");
-          if (import.meta.env.DEV && err) console.error(err);
+          reportError("Cancel split request failed", err);
         } finally {
           splitAbortRef.current?.abort();
           clearUploadState();
           const elapsed = Date.now() - startAt;
           const delay = Math.max(0, minDelDisplayMs - elapsed);
           if (delay > 0) {
-            setTimeout(() => setIsCancellingSplit(false), delay);
+            if (cancelSplitDelayTimeoutRef.current) clearTimeout(cancelSplitDelayTimeoutRef.current);
+            cancelSplitDelayTimeoutRef.current = setTimeout(() => {
+              cancelSplitDelayTimeoutRef.current = null;
+              setIsCancellingSplit(false);
+            }, delay);
           } else {
             setIsCancellingSplit(false);
           }
@@ -685,8 +758,7 @@ export default function App() {
         }
       } catch (err) {
         if (err instanceof Error && err.name !== "AbortError") {
-          console.error("Upload failed");
-          if (import.meta.env.DEV) console.error(err); // dev only; production does not expose stack
+          reportError("Upload failed", err);
         }
         setIsUploading(false);
         setUploadProgress(null);
@@ -753,8 +825,12 @@ export default function App() {
         if (hasChunks) {
           setTranscribeChunkProgress((prev) => (prev ? { ...prev, current: prev.total } : null));
         }
-        if (result.failed_chunk_ids?.length && result.text_segments && result.failed_chunk_indices?.length) {
+        if (hasChunks && result.text_segments?.length) {
           setTranscribeSegments(result.text_segments);
+        } else {
+          setTranscribeSegments(null);
+        }
+        if (result.failed_chunk_ids?.length && result.text_segments && result.failed_chunk_indices?.length) {
           setFailedChunkIds(result.failed_chunk_ids);
           setFailedChunkIndices(result.failed_chunk_indices);
           setTranscribeError(`Partial: ${result.failed_chunk_ids.length} chunk(s) failed. You can retry failed chunks.`);
@@ -965,19 +1041,35 @@ export default function App() {
       return;
     }
     if (source === "summary" && summarizeResult) {
-      doDownload(summarizeResult, format, uploadFileName || "Current summary");
+      const base =
+        uploadFileName && uploadFileName.trim()
+          ? `${downloadBaseName(uploadFileName)}(sum)`
+          : "Current summary";
+      doDownload(summarizeResult, format, base);
       return;
     }
     if (source === "translation" && translateResult) {
-      doDownload(translateResult, format, uploadFileName || "Current translation");
+      const base =
+        uploadFileName && uploadFileName.trim()
+          ? `${downloadBaseName(uploadFileName)}(trans)`
+          : "Current translation";
+      doDownload(translateResult, format, base);
       return;
     }
     if (source === "transcription" && transcribeText) {
-      doDownload(transcribeText, format, downloadBaseName(uploadFileName));
+      const base =
+        uploadFileName && uploadFileName.trim()
+          ? `${downloadBaseName(uploadFileName)}(raw)`
+          : "Current transcript";
+      doDownload(transcribeText, format, base);
       return;
     }
     if (source === "restructure" && restructureResultText) {
-      doDownload(restructureResultText, format, "restructure");
+      const base =
+        uploadFileName && uploadFileName.trim()
+          ? `${downloadBaseName(uploadFileName)}(art)`
+          : "Current article";
+      doDownload(restructureResultText, format, base);
     }
   }, [
     pendingTranscriptionDownload,
@@ -1042,16 +1134,22 @@ export default function App() {
   );
 
   const handleTranslate = useCallback(async () => {
-    if (!transcribeText?.trim() || isTranslating) return;
+    const useSegments = transcribeSegments && transcribeSegments.length > 0;
+    const hasInput = useSegments || (transcribeText != null && transcribeText.trim() !== "");
+    if (!hasInput || isTranslating) return;
     setTranslateError(null);
     setTranslateResult(null);
     setIsTranslating(true);
     try {
       const targetLang = translateOption === "en-cn" ? "zh" : "en";
-      const res = await translate(transcribeText.trim(), targetLang, {
-        signal: apiAbortRef.current?.signal,
-        engine: selectedEngine,
-      });
+      const res = await translate(
+        useSegments ? transcribeSegments : transcribeText!.trim(),
+        targetLang,
+        {
+          signal: apiAbortRef.current?.signal,
+          engine: selectedEngine,
+        }
+      );
       setTranslateResult(res.text);
       addTranslationToHistory(uploadFileName || "Current transcript", res.text);
     } catch (e) {
@@ -1060,7 +1158,7 @@ export default function App() {
     } finally {
       setIsTranslating(false);
     }
-  }, [transcribeText, translateOption, isTranslating, uploadFileName, addTranslationToHistory, selectedEngine]);
+  }, [transcribeText, transcribeSegments, translateOption, isTranslating, uploadFileName, addTranslationToHistory, selectedEngine]);
 
   const runTranslateFromHistoryItem = useCallback(
     async (item: TranscriptionListItem, direction: "en-cn" | "cn-en") => {
@@ -1071,7 +1169,22 @@ export default function App() {
       try {
         const detail = await getTranscription(item.id, { signal: apiAbortRef.current?.signal });
         const targetLang = direction === "en-cn" ? "zh" : "en";
-        const res = await translate(detail.text.trim(), targetLang, {
+
+        // Prefer segmented translation when segments were persisted in transcription meta.
+        const rawSegments = (detail.meta as any)?.segments;
+        const segments: string[] | null = Array.isArray(rawSegments)
+          ? rawSegments
+              .map((s: unknown) => (typeof s === "string" ? s.trim() : ""))
+              .filter((s: string) => s.length > 0)
+          : null;
+
+        const hasSegments = segments != null && segments.length > 0;
+        const text = detail.text?.trim() || "";
+        if (!hasSegments && !text) {
+          throw new Error("Empty transcript text");
+        }
+
+        const res = await translate(hasSegments ? segments! : text, targetLang, {
           signal: apiAbortRef.current?.signal,
           engine: selectedEngine,
         });
@@ -1505,11 +1618,102 @@ export default function App() {
 
         <div className="content-layout">
           <nav className="sub-nav">
-            <a href="#" className="sub-nav-link">Home</a>
-            <a href="#" className="sub-nav-active">Transcribe and Translate</a>
+            <a
+              href="#"
+              className={`sub-nav-home${subNavActive === "home" ? " sub-nav-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setSubNavActive("home"); }}
+            >
+              Home
+            </a>
+            <a
+              href="#"
+              className={`sub-nav-link${subNavActive === "get-info" ? " sub-nav-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setSubNavActive("get-info"); }}
+            >
+              Get Information
+            </a>
+            <a
+              href="#"
+              className={`sub-nav-link${subNavActive === "transcribe" ? " sub-nav-active" : ""}`}
+              onClick={(e) => { e.preventDefault(); setSubNavActive("transcribe"); }}
+            >
+              Transcribe and Translate
+            </a>
           </nav>
 
+          {/* Get Information and Transcribe and Translate are independent: do not change Transcribe and Translate's <main> content or business logic when editing Get Information. */}
           <main className="main">
+            {subNavActive === "get-info" && (
+              <>
+                <div className="main-title-row">
+                  <h1 className="main-title">Get Information</h1>
+                </div>
+                <div className="intro"><span className="intro-label">Introduction: </span><span className="intro-placeholder" title="placeholder">placeholder</span></div>
+                <div className="steps steps-podcasts">
+                  <section className="step">
+                    <div className="step-head">
+                      <img src={podcastsIcon} alt="" width={24} height={24} />
+                      <span className="step-title">Podcasts</span>
+                    </div>
+                    <div className="step-body">
+                      {podcastRows.map((row) => (
+                        <div key={row.id} className="step-row">
+                          <div className="step-inner">
+                            <input
+                              type="text"
+                              id={`step-podcast-name-input-${row.id}`}
+                              name="podcast-name"
+                              className={`step-input step-podcast-name-input${row.showValidationError && !row.name.trim() ? " podcast-input-error" : ""}`}
+                              placeholder="Input a podcast name"
+                              aria-label="Podcast name"
+                              autoComplete="off"
+                              value={row.name}
+                              onChange={(e) => { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, name: e.target.value, showValidationError: false } : r)); }}
+                              disabled={row.inputsDisabled}
+                            />
+                            <input
+                              type="text"
+                              id={`step-podcast-link-input-${row.id}`}
+                              name="podcast-link"
+                              className={`step-input step-podcast-link-input${row.showValidationError && !row.link.trim() ? " podcast-input-error" : ""}`}
+                              placeholder="Input a podcast link"
+                              aria-label="Podcast link"
+                              autoComplete="off"
+                              value={row.link}
+                              onChange={(e) => { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, link: e.target.value, showValidationError: false } : r)); }}
+                              disabled={row.inputsDisabled}
+                          />
+                          </div>
+                          <div className="step-podcast-actions">
+                            <button type="button" className="step-podcast-save" aria-label={row.inputsDisabled ? "Edit podcast" : "Save podcast"} onClick={async () => { if (row.inputsDisabled) { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, inputsDisabled: false } : r)); return; } const nameOk = row.name.trim() !== ""; const linkOk = row.link.trim() !== ""; if (!nameOk || !linkOk) { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, showValidationError: true } : r)); return; } try { if (row.id.startsWith("new-")) { const res = await savePodcast(row.name, row.link); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, id: res.id, inputsDisabled: true, showValidationError: false } : r)); } else { await updatePodcast(row.id, row.name, row.link); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, inputsDisabled: true, showValidationError: false } : r)); } } catch (e) { alert(e instanceof Error ? e.message : "Save failed"); } }}>{row.inputsDisabled ? <img src={editIcon} alt="" className="step-podcast-save-icon" /> : <img src={saveIcon} alt="" className="step-podcast-save-icon" />}</button>
+                            <button type="button" className="step-podcast-rss" aria-label="RSS" disabled={!row.inputsDisabled || !row.name.trim() || !row.link.trim()} onClick={async () => { const link = row.link.trim(); if (!link) { alert("Input podcast link first."); return; } try { const { feedUrl } = await getPodcastRss(link); await updatePodcastRss(row.id, feedUrl); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, rss: feedUrl } : r)); await navigator.clipboard.writeText(feedUrl); alert(`${feedUrl}\n\nRSS has been copied.`); } catch (e) { alert(e instanceof Error ? e.message : "Invalid Apple Podcasts link"); } }}><img src={rssIcon} alt="" className="step-podcast-rss-icon" /></button>
+                            <button type="button" className="step-podcast-preview" aria-label="Preview podcast" disabled={!row.inputsDisabled || !row.name.trim() || !row.link.trim()} onClick={async () => { const link = row.link.trim(); if (!link) return; let feedUrl = (row.rss || "").trim(); if (!feedUrl) { try { const r = await getPodcastRss(link); feedUrl = r.feedUrl; } catch (e) { alert(e instanceof Error ? e.message : "Could not get RSS feed"); return; } } setPodcastPreviewOpen(true); setPodcastPreviewLoading(true); setPodcastPreviewLinks([]); setPodcastPreviewSelectedIndices([]); try { const links = await getPodcastFeedAudioLinks(feedUrl); setPodcastPreviewLinks(links); } catch (e) { setPodcastPreviewLinks([]); alert(e instanceof Error ? e.message : "Failed to fetch audio links"); } finally { setPodcastPreviewLoading(false); } }}>
+                              <img src={previewIcon} alt="" className="step-podcast-preview-icon" />
+                            </button>
+                            <button type="button" className="step-podcast-delete" aria-label="Delete podcast" onClick={async () => { if (!row.id.startsWith("new-")) { try { await deletePodcast(row.id); } catch { /* ignore */ } } setPodcastRows(prev => prev.filter(r => r.id !== row.id)); }}><img src={deleteIcon} alt="" className="step-podcast-delete-icon" /></button>
+                          </div>
+                        </div>
+                      ))}
+                      <div className="step-row step-podcast-add-row">
+                        <div className="step-podcast-add-row-spacer" aria-hidden="true" />
+                        <div className="step-podcast-actions">
+                          <span className="step-podcast-add-row-placeholder" aria-hidden="true" />
+                          <button type="button" className="step-podcast-add" aria-label="Add podcast" onClick={() => setPodcastRows(prev => [...prev, { id: `new-${Date.now()}`, name: "", link: "", inputsDisabled: false, showValidationError: false }])}><img src={addIcon} alt="" className="step-podcast-add-icon" /></button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+              </>
+            )}
+            {subNavActive === "home" && (
+              <div className="main-home">
+                <h1 className="main-title">Home</h1>
+                <div className="intro"><span className="intro-label">Introduction: </span><span className="intro-placeholder" title="placeholder">placeholder</span></div>
+              </div>
+            )}
+            {subNavActive === "transcribe" && (
+              <>
             <div className="main-title-row">
               <h1 className="main-title">Transcribe and Translate</h1>
               <div className="engine-toggle" role="group" aria-label="Engine (transcription & translation)">
@@ -1565,7 +1769,7 @@ export default function App() {
                           id="step-chunk-input"
                           name="chunk-size"
                           className="step-input step-chunk-num"
-                          placeholder="5"
+                          placeholder="3"
                           aria-label="Chunk size in minutes"
                           value={chunkSizeInput}
                           onChange={(e) => {
@@ -2107,14 +2311,10 @@ export default function App() {
                           <button
                             type="button"
                             className="history-item-wechat"
-                            title="wechat"
-                          >
-                            <img src={wechatIcon} alt="" width={24} height={24} />
-                          </button>
-                          <button
-                            type="button"
-                            className="history-item-wechat"
-                            title="notion"
+                            title="Push to Notion"
+                            onClick={() => {
+                              setPendingNotionArticleItem(item);
+                            }}
                           >
                             <img src={notionIcon} alt="" width={24} height={24} />
                           </button>
@@ -2165,6 +2365,8 @@ export default function App() {
                 </ul>
               )}
             </div>
+              </>
+            )}
           </main>
         </div>
         <footer className="footer">
@@ -2193,38 +2395,139 @@ export default function App() {
         </div>
       )}
 
-      {(pendingDeleteTranscriptionItem !== null || pendingDeleteTranslationItem !== null || pendingDeleteSummaryItem !== null || pendingDeleteArticleItem !== null) && (
-        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+      {(pendingDeleteTranscriptionItem !== null ||
+        pendingDeleteTranslationItem !== null ||
+        pendingDeleteSummaryItem !== null ||
+        pendingDeleteArticleItem !== null ||
+        pendingNotionArticleItem !== null) && (
+        <div
+          className="confirm-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-confirm-title"
+        >
           <div className="confirm-dialog">
-            <p id="delete-confirm-title" className="confirm-text">Do you want to delete?</p>
+            <p id="delete-confirm-title" className="confirm-text">
+              {pendingNotionArticleItem !== null ? "Do you want to push to Notion?" : "Do you want to delete?"}
+            </p>
+            {pendingNotionArticleItem?.notion_url && (
+              <p className="confirm-text" style={{ marginTop: 8, fontSize: "0.9em" }}>
+                Last pushed:{" "}
+                <a
+                  href={pendingNotionArticleItem.notion_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  Open
+                </a>
+              </p>
+            )}
             <div className="confirm-actions">
-              <button
-                type="button"
-                className="confirm-btn confirm-btn-yes"
-                onClick={async () => {
-                  if (pendingDeleteTranscriptionItem !== null) {
-                    await handleDeleteTranscriptionItem(pendingDeleteTranscriptionItem);
-                    setPendingDeleteTranscriptionItem(null);
-                  }
-                  if (pendingDeleteTranslationItem !== null) {
-                    await handleDeleteTranslationItem(pendingDeleteTranslationItem);
-                    setPendingDeleteTranslationItem(null);
-                  }
-                  if (pendingDeleteSummaryItem !== null) {
-                    await handleDeleteSummaryItem(pendingDeleteSummaryItem);
-                    setPendingDeleteSummaryItem(null);
-                  }
-                  if (pendingDeleteArticleItem !== null) {
-                    await handleDeleteArticleItem(pendingDeleteArticleItem);
-                    setPendingDeleteArticleItem(null);
-                  }
-                }}
-              >
-                Yes
-              </button>
-              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => { setPendingDeleteTranscriptionItem(null); setPendingDeleteTranslationItem(null); setPendingDeleteSummaryItem(null); setPendingDeleteArticleItem(null); }}>
-                No
-              </button>
+              {pendingNotionArticleItem !== null ? (
+                <>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-yes"
+                    onClick={async () => {
+                      const item = pendingNotionArticleItem;
+                      setPendingNotionArticleItem(null);
+                      try {
+                        const res = await exportArticleToNotion(item.id, "main", {
+                          signal: apiAbortRef.current?.signal,
+                        });
+                        if (res.notion_url) {
+                          window.open(res.notion_url, "_blank", "noopener,noreferrer");
+                        }
+                        listArticles({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+                          .then(setRestructureHistoryItems)
+                          .catch(() => {});
+                      } catch (err) {
+                        // eslint-disable-next-line no-alert
+                        alert(
+                          err instanceof Error ? err.message : "Failed to export article to Notion"
+                        );
+                      }
+                    }}
+                  >
+                    Main
+                  </button>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-yes"
+                    onClick={async () => {
+                      const item = pendingNotionArticleItem;
+                      setPendingNotionArticleItem(null);
+                      try {
+                        const res = await exportArticleToNotion(item.id, "alt", {
+                          signal: apiAbortRef.current?.signal,
+                        });
+                        if (res.notion_url) {
+                          window.open(res.notion_url, "_blank", "noopener,noreferrer");
+                        }
+                        listArticles({ limit: HISTORY_PAGE_SIZE, offset: 0, signal: apiAbortRef.current?.signal })
+                          .then(setRestructureHistoryItems)
+                          .catch(() => {});
+                      } catch (err) {
+                        // eslint-disable-next-line no-alert
+                        alert(
+                          err instanceof Error ? err.message : "Failed to export article to Notion"
+                        );
+                      }
+                    }}
+                  >
+                    Alt
+                  </button>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-no"
+                    onClick={() => {
+                      setPendingNotionArticleItem(null);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-yes"
+                    onClick={async () => {
+                      if (pendingDeleteTranscriptionItem !== null) {
+                        await handleDeleteTranscriptionItem(pendingDeleteTranscriptionItem);
+                        setPendingDeleteTranscriptionItem(null);
+                      }
+                      if (pendingDeleteTranslationItem !== null) {
+                        await handleDeleteTranslationItem(pendingDeleteTranslationItem);
+                        setPendingDeleteTranslationItem(null);
+                      }
+                      if (pendingDeleteSummaryItem !== null) {
+                        await handleDeleteSummaryItem(pendingDeleteSummaryItem);
+                        setPendingDeleteSummaryItem(null);
+                      }
+                      if (pendingDeleteArticleItem !== null) {
+                        await handleDeleteArticleItem(pendingDeleteArticleItem);
+                        setPendingDeleteArticleItem(null);
+                      }
+                    }}
+                  >
+                    Yes
+                  </button>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-no"
+                    onClick={() => {
+                      setPendingDeleteTranscriptionItem(null);
+                      setPendingDeleteTranslationItem(null);
+                      setPendingDeleteSummaryItem(null);
+                      setPendingDeleteArticleItem(null);
+                    }}
+                  >
+                    No
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -2243,6 +2546,183 @@ export default function App() {
             </div>
             <div className="confirm-actions" style={{ marginTop: 12 }}>
               <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPreviewOpen(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {podcastPreviewOpen && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="podcast-preview-dialog-title" onClick={() => setPodcastPreviewOpen(false)}>
+          <div className="confirm-dialog confirm-dialog-preview" onClick={(e) => e.stopPropagation()}>
+            <p id="podcast-preview-dialog-title" className="confirm-text">Podcast audio/video links</p>
+            <div className="preview-dialog-body">
+              {podcastPreviewLoading ? (
+                <p className="preview-loading">Loading…</p>
+              ) : podcastPreviewLinks.length === 0 ? (
+                <p className="preview-loading">No audio links found.</p>
+              ) : (
+                <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
+                  <strong style={{ color: "var(--primary)", fontFamily: "Verdana, sans-serif", height: 24, display: "flex", alignItems: "center", justifyContent: "center", width: "100%" }}>
+                    Episodes
+                  </strong>
+                  <div
+                    style={{
+                      marginTop: 24,
+                      maxHeight: 280,
+                      overflowY: "auto",
+                      overflowX: "hidden",
+                      border: "1px solid var(--border)",
+                      borderRadius: 6,
+                      padding: 0,
+                    }}
+                  >
+                    <ul style={{ listStyle: "none", margin: 0, padding: 0, minWidth: 0 }}>
+                      {podcastPreviewLinks.map((a, idx) => (
+                        <li key={idx} className="history-item" style={{ borderBottom: "1px dotted var(--border)", paddingLeft: 12, paddingRight: 12, minWidth: 0 }}>
+                          <label
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              width: "100%",
+                              minWidth: 0,
+                              cursor: "pointer",
+                            }}
+                          >
+                            {/* checkbox + title: flex, truncate */}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                flex: "1 1 0",
+                                minWidth: 0,
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                className="restructure-checkbox"
+                                style={{ marginRight: 8 }}
+                                checked={podcastPreviewSelectedIndices.includes(idx)}
+                                onChange={(e) => {
+                                  if (e.target.checked) setPodcastPreviewSelectedIndices((prev) => [...prev, idx].sort((x, y) => x - y));
+                                  else setPodcastPreviewSelectedIndices((prev) => prev.filter((i) => i !== idx));
+                                }}
+                              />
+                              <span className="history-item-name" title={a.title ?? a.url}>
+                                {a.title ?? "-"}
+                              </span>
+                            </span>
+                            {/* download + split + transcribe: fixed width, no shrink */}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                flex: "0 0 88px",
+                                gap: 8,
+                                marginRight: 8,
+                              }}
+                            >
+                              <button
+                                type="button"
+                                className="history-item-download"
+                                title="download"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  downloadPodcastEpisodeAudio(
+                                    a.url,
+                                    podcastEpisodeDownloadName(a.title ?? undefined, a.url),
+                                  );
+                                }}
+                              >
+                                <img src={downloadIcon} alt="" width={24} height={24} />
+                              </button>
+                              <button
+                                type="button"
+                                className="history-item-split"
+                                title="split"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // TODO: wire to split flow for this episode (a.url, a.title)
+                                }}
+                              >
+                                <img src={splitIcon} alt="" width={24} height={24} />
+                              </button>
+                              <button
+                                type="button"
+                                className="history-item-transcribe"
+                                title="transcribe"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // TODO: wire to transcribe flow for this episode (a.url, a.title)
+                                }}
+                              >
+                                <img src={transcribeIcon} alt="" width={24} height={24} />
+                              </button>
+                            </span>
+                            {/* URL: flex, truncate */}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                flex: "1 1 0",
+                                minWidth: 0,
+                              }}
+                            >
+                              <a href={a.url} target="_blank" rel="noopener noreferrer" className="podcast-preview-link" title={a.url}>
+                                {a.url}
+                              </a>
+                            </span>
+                            {/* time: can shrink with ellipsis */}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "flex-end",
+                                flex: "0 1 140px",
+                                minWidth: 0,
+                              }}
+                            >
+                              <span className="history-item-time">{formatPubDate(a.pub_date)}</span>
+                            </span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="confirm-actions" style={{ marginTop: 12 }}>
+              {!podcastPreviewLoading && podcastPreviewLinks.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-yes"
+                    onClick={() => {
+                      const lines = podcastPreviewLinks.filter((_, i) => podcastPreviewSelectedIndices.includes(i)).map((a) => `${formatPubDate(a.pub_date)}  ${a.title ?? "-"}  ${a.url}`);
+                      navigator.clipboard.writeText(lines.join("\n"));
+                      alert(lines.length ? "Copied." : "No selection.");
+                    }}
+                  >
+                    Copy selected
+                  </button>
+                  <button
+                    type="button"
+                    className="confirm-btn confirm-btn-yes"
+                    onClick={() => {
+                      navigator.clipboard.writeText(podcastPreviewLinks.map((a) => `${formatPubDate(a.pub_date)}  ${a.title ?? "-"}  ${a.url}`).join("\n"));
+                      alert("Copied.");
+                    }}
+                  >
+                    Copy all
+                  </button>
+                </>
+              )}
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPodcastPreviewOpen(false)}>
                 Close
               </button>
             </div>
@@ -2363,11 +2843,12 @@ export default function App() {
         <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="restructure-dialog-title">
           <div className="confirm-dialog confirm-dialog-restructure">
             <p id="restructure-dialog-title" className="confirm-text">Choose result files (each type can have only one selected file).</p>
-            <div className="step-body" style={{ maxHeight: 360, minHeight: 0 }}>
-              <div
-                className="step-inner"
-                style={{ display: "flex", flexDirection: "row", gap: 12, height: "100%" }}
-              >
+            <div className="preview-dialog-body">
+              <div className="step-body" style={{ maxHeight: 360, minHeight: 0 }}>
+                <div
+                  className="step-inner"
+                  style={{ display: "flex", flexDirection: "row", gap: 12, height: "100%" }}
+                >
                 {/* Transcriptions column */}
                 <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
                   <strong
@@ -2393,6 +2874,7 @@ export default function App() {
                   ) : (
                     <div
                       style={{
+                        marginTop: 12,
                         maxHeight: 280,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
@@ -2468,6 +2950,7 @@ export default function App() {
                   ) : (
                     <div
                       style={{
+                        marginTop: 12,
                         maxHeight: 280,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
@@ -2543,6 +3026,7 @@ export default function App() {
                   ) : (
                     <div
                       style={{
+                        marginTop: 12,
                         maxHeight: 280,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
@@ -2597,6 +3081,7 @@ export default function App() {
                     </div>
                   )}
                 </div>
+              </div>
               </div>
             </div>
             <div className="confirm-actions" style={{ marginTop: 12 }}>

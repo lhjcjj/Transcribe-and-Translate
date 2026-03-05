@@ -7,8 +7,12 @@ import queue
 import re
 import shutil
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable
+from typing import AsyncIterator, Callable
+from urllib.parse import urlparse, unquote
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +55,27 @@ from app.schemas.summary_history import (
 from app.schemas.article_history import (
     ArticleDetail,
     ArticleListItem,
+    ArticleNotionExportRequest,
+    ArticleNotionExportResponse,
     ArticleSaveRequest,
     ArticleSaveResponse,
 )
-from app.api import transcription_history, translation_history, summary_history, article_history
+from app.schemas.podcast_history import (
+    PodcastFeedAudioItem,
+    PodcastListItem,
+    PodcastRssRequest,
+    PodcastSaveRequest,
+    PodcastSaveResponse,
+    PodcastUpdateRequest,
+)
+from app.api import transcription_history, translation_history, summary_history, article_history, podcast_history
 from app.schemas.translate import TranslateRequest, TranslateResponse
 from app.services import audio_split as audio_split_svc
 from app.services import transcribe as transcribe_svc
 from app.services import translate as translate_svc
 from app.services import summarize as summarize_svc
 from app.services import summarize_qwen as summarize_qwen_svc
+from app.services import notion_articles as notion_articles_svc
 
 
 class SplitCancelled(Exception):
@@ -76,12 +91,9 @@ _MULTIPART_OVERHEAD_BYTES = 1 * 1024 * 1024  # 1MB for Content-Length reject
 PROGRESS_YIELD_DELAY_SEC = 0.2
 
 
-def _upload_413_message() -> str:
-    return f"Request body too large (max {config.MAX_UPLOAD_BYTES} bytes)"
-
-
-def _transcribe_413_message() -> str:
-    return f"File too large (max {config.MAX_TRANSCRIBE_BYTES} bytes)"
+def _reject_413_size(max_bytes: int, kind: str = "Request body") -> None:
+    """Raise HTTP 413 for size limit exceeded. Never returns."""
+    raise HTTPException(413, f"{kind} too large (max {max_bytes} bytes)")
 
 
 # Sanitize target_lang: alphanumeric, spaces, hyphens only (no injection)
@@ -90,11 +102,6 @@ TARGET_LANG_PATTERN = re.compile(r"^[a-zA-Z0-9\u4e00-\u9fff\s\-]{1,20}$")
 # Filename: max length and allowed chars (alphanumeric, dot, underscore, hyphen, space, basic Unicode letters)
 FILENAME_MAX_LENGTH = 200
 FILENAME_ALLOWED_PATTERN = re.compile(r"[a-zA-Z0-9._\s\-\u4e00-\u9fff]+")
-
-
-def _reject_413(message: str) -> None:
-    """Raise HTTP 413 with the given message (caller never returns)."""
-    raise HTTPException(413, message)
 
 
 def _chunk_filename_to_original(chunk_filename: str) -> str:
@@ -118,6 +125,29 @@ def _sanitize_filename(audio: UploadFile) -> str:
     # Truncate to max length
     if len(name) > FILENAME_MAX_LENGTH:
         name = name[:FILENAME_MAX_LENGTH].rstrip() or "audio"
+    return name
+
+
+def _sanitize_download_filename_from_url(url: str) -> str:
+    """Infer a safe download filename from a URL (used for podcast episode downloads)."""
+    name = ""
+    try:
+        parsed = urlparse(url)
+        path = unquote(parsed.path or "")
+        if path:
+            name = os.path.basename(path)
+    except Exception:
+        name = ""
+    if not name:
+        name = "audio.mp3"
+    # Ensure extension looks like audio; default to .mp3 when missing.
+    lower = name.lower()
+    if not any(lower.endswith(ext) for ext in (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus")):
+        name = f"{name}.mp3"
+    # Keep only allowed characters and enforce max length.
+    name = ("".join(FILENAME_ALLOWED_PATTERN.findall(name))).strip() or "audio.mp3"
+    if len(name) > FILENAME_MAX_LENGTH:
+        name = name[:FILENAME_MAX_LENGTH].rstrip() or "audio.mp3"
     return name
 
 
@@ -182,14 +212,14 @@ async def upload(req: Request, audio: UploadFile = File(...)) -> UploadResponse:
         try:
             cl = int(cl_raw)
             if cl > config.MAX_UPLOAD_BYTES + _MULTIPART_OVERHEAD_BYTES:
-                _reject_413(_upload_413_message())
+                _reject_413_size(config.MAX_UPLOAD_BYTES, "Request body")
         except ValueError:
             pass
 
     async with upload_semaphore:
         try:
             body = await read_file_with_size_cap(
-                audio, config.MAX_UPLOAD_BYTES, lambda: _reject_413(_upload_413_message())
+                audio, config.MAX_UPLOAD_BYTES, lambda: _reject_413_size(config.MAX_UPLOAD_BYTES, "Request body")
             )
             if len(body) == 0:
                 del body
@@ -589,7 +619,7 @@ async def transcribe(
             if not allowed_audio_content_type(f.content_type):
                 raise HTTPException(400, "Invalid file type: audio only")
             body = await read_file_with_size_cap(
-                f, config.MAX_TRANSCRIBE_BYTES, lambda: _reject_413(_transcribe_413_message())
+                f, config.MAX_TRANSCRIBE_BYTES, lambda: _reject_413_size(config.MAX_TRANSCRIBE_BYTES, "File")
             )
             if len(body) == 0:
                 del body
@@ -630,6 +660,8 @@ async def transcribe(
                 "clean_up": do_clean_up,
                 "failed_chunk_ids": failed_chunk_ids or None,
                 "failed_chunk_indices": failed_chunk_indices or None,
+                # Persist per-chunk text segments for future segmented translation.
+                "segments": segments or None,
             },
         )
         return TranscribeResponse(
@@ -703,6 +735,8 @@ def _transcribe_upload_ids_to_queue(
             "clean_up": clean_up,
             "failed_chunk_ids": failed_chunk_ids or None,
             "failed_chunk_indices": failed_chunk_indices or None,
+            # Persist per-chunk text segments for future segmented translation.
+            "segments": segments or None,
         },
     )
     progress_queue.put({
@@ -910,19 +944,53 @@ async def delete_article(article_id: str) -> None:
         raise HTTPException(404, "Not found")
 
 
+@router.post("/articles/{article_id}/notion", response_model=ArticleNotionExportResponse)
+async def export_article_to_notion(
+    article_id: str,
+    body: ArticleNotionExportRequest | None = None,
+) -> ArticleNotionExportResponse:
+    """Create a Notion page for the given article id with a 2-column layout."""
+    data = article_history.get_article(article_id)
+    if data is None:
+        raise HTTPException(404, "Not found")
+    try:
+        result = notion_articles_svc.export_article_to_notion(
+            display_name=data["display_name"],
+            text=data.get("text") or "",
+            database=(body.database if body else None),
+        )
+    except notion_articles_svc.NotionConfigError as e:
+        logger.warning("Notion integration not configured: %s", e)
+        raise HTTPException(503, "Notion integration not configured")
+    except notion_articles_svc.NotionApiError as e:
+        logger.warning("Notion API error: %s", e)
+        raise HTTPException(502, "Notion export failed")
+    except Exception:
+        logger.error("Notion export failed")
+        raise HTTPException(502, "Notion export failed")
+
+    notion_url = result.get("url")
+    notion_page_id = result.get("page_id")
+    article_history.update_article_notion(article_id, notion_url, notion_page_id)
+    return ArticleNotionExportResponse(notion_page_id=notion_page_id, notion_url=notion_url)
+
+
 @router.post("/translate", response_model=TranslateResponse)
 async def translate(req: TranslateRequest) -> TranslateResponse:
-    """Translate text to target language."""
+    """Translate text to target language. When segments are provided, translates each and joins (avoids long single-request timeouts)."""
     if not TARGET_LANG_PATTERN.match(req.target_lang):
         raise HTTPException(400, "Invalid target_lang")
 
     try:
-        text = translate_svc.translate_text(req.text, req.target_lang, engine=req.engine)
+        if req.segments and len(req.segments) > 0:
+            text = translate_svc.translate_text_segments(req.segments, req.target_lang, engine=req.engine)
+        else:
+            text = translate_svc.translate_text((req.text or "").strip(), req.target_lang, engine=req.engine)
     except ValueError as e:
         logger.warning("Translation configuration/local error: %s", e)
         raise HTTPException(503, "Translation service unavailable")
-    except Exception:
-        logger.exception("Translation request failed")
+    except Exception as e:
+        logger.exception("Translation request failed: %s", e)
         raise HTTPException(502, "Translation request failed")
 
     return TranslateResponse(text=text)
@@ -940,8 +1008,216 @@ async def summarize(req: SummarizeRequest) -> SummarizeResponse:
     except ValueError as e:
         logger.warning("Summary configuration/local error: %s", e)
         raise HTTPException(503, "Summary service unavailable")
-    except Exception:
-        logger.exception("Summary request failed")
+    except Exception as e:
+        logger.exception("Summary request failed: %s", e)
         raise HTTPException(502, "Summary request failed")
 
     return SummarizeResponse(text=text)
+
+
+_APPLE_PODCAST_ID_RE = re.compile(r"podcasts\.apple\.com[/\w]*/id(\d+)", re.IGNORECASE)
+
+
+@router.get("/podcast/rss")
+async def get_podcast_rss(link: str) -> dict:
+    """Resolve Apple Podcasts link to RSS feed URL via iTunes Lookup API."""
+    link = (link or "").strip()
+    if not link:
+        raise HTTPException(400, "link is required")
+    match = _APPLE_PODCAST_ID_RE.search(link)
+    if not match:
+        raise HTTPException(400, "Invalid Apple Podcasts link; expected URL containing podcasts.apple.com/.../id<number>")
+    podcast_id = match.group(1)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                "https://itunes.apple.com/lookup",
+                params={"id": podcast_id, "country": "US", "media": "podcast"},
+            )
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as e:
+        logger.warning("iTunes lookup failed for id=%s: %s", podcast_id, e)
+        raise HTTPException(502, "Could not fetch podcast info from Apple")
+    results = data.get("results") or []
+    if not results:
+        raise HTTPException(404, "Podcast not found")
+    feed_url = results[0].get("feedUrl")
+    if not feed_url:
+        raise HTTPException(404, "RSS feed URL not available for this podcast")
+    return {"feedUrl": feed_url}
+
+
+def _parse_rss_audio_enclosures(xml_text: str) -> list[dict]:
+    """Parse RSS/Atom XML and return list of {url, title?, pub_date?} for all enclosures (same as regex url=\"...\")."""
+    out: list[dict] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+
+    def local_tag(elem: ET.Element) -> str:
+        tag = elem.tag
+        if isinstance(tag, str) and "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def text_of(parent: ET.Element, name: str) -> str | None:
+        for c in parent:
+            if local_tag(c) == name and c.text is not None:
+                return (c.text or "").strip() or None
+        return None
+
+    # RSS: rss > channel > item; Atom: feed > entry
+    channel_or_feed = None
+    item_tag = "item"
+    if local_tag(root) == "rss":
+        for c in root:
+            if local_tag(c) == "channel":
+                channel_or_feed = c
+                break
+    elif local_tag(root) == "feed":
+        channel_or_feed = root
+        item_tag = "entry"
+
+    if channel_or_feed is None:
+        return out
+
+    for elem in channel_or_feed:
+        if local_tag(elem) != item_tag:
+            continue
+        title = text_of(elem, "title")
+        pub_date = text_of(elem, "pubDate") or text_of(elem, "published") or text_of(elem, "updated")
+        for c in elem:
+            if local_tag(c) != "enclosure":
+                continue
+            url = c.get("url") or c.get("href")
+            if not url or not url.strip():
+                continue
+            # Same as regex approach: extract every enclosure url (no type filter)
+            out.append({
+                "url": url.strip(),
+                "title": title,
+                "pub_date": pub_date,
+            })
+    return out
+
+
+@router.get("/podcast/feed/audio-links", response_model=list[PodcastFeedAudioItem])
+async def get_podcast_feed_audio_links(feed_url: str) -> list[PodcastFeedAudioItem]:
+    """Fetch RSS feed and return all audio enclosure URLs (for Preview)."""
+    feed_url = (feed_url or "").strip()
+    if not feed_url:
+        raise HTTPException(400, "feed_url is required")
+    if not feed_url.startswith("http://") and not feed_url.startswith("https://"):
+        raise HTTPException(400, "feed_url must be http or https")
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(feed_url)
+        r.raise_for_status()
+        xml_text = r.text
+    except httpx.HTTPError as e:
+        logger.warning("Failed to fetch feed %s: %s", feed_url[:80], e)
+        raise HTTPException(502, "Could not fetch RSS feed")
+    items = _parse_rss_audio_enclosures(xml_text)
+    return [PodcastFeedAudioItem(**x) for x in items]
+
+
+@router.get("/podcast/download")
+async def download_podcast_audio(url: str, filename: str | None = None) -> StreamingResponse:
+    """Proxy download for podcast episode audio.
+
+    Streams from the remote URL to the client so the browser starts receiving data
+    immediately instead of waiting for the backend to download the entire file first.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(400, "url must be http or https")
+
+    safe_filename: str
+    if filename:
+        name = filename.strip() or "audio.mp3"
+        lower = name.lower()
+        if not any(lower.endswith(ext) for ext in (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus")):
+            name = f"{name}.mp3"
+        name = ("".join(FILENAME_ALLOWED_PATTERN.findall(name))).strip() or "audio.mp3"
+        if len(name) > FILENAME_MAX_LENGTH:
+            name = name[:FILENAME_MAX_LENGTH].rstrip() or "audio.mp3"
+        safe_filename = name
+    else:
+        safe_filename = _sanitize_download_filename_from_url(url)
+
+    # Optional HEAD to get Content-Type; if HEAD fails (e.g. 405), we still stream with GET
+    content_type = "application/octet-stream"
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            head_r = await client.head(url)
+            if head_r.status_code < 400 and head_r.headers.get("content-type"):
+                content_type = head_r.headers.get("content-type", "").split(";")[0].strip() or content_type
+    except Exception:
+        pass
+
+    async def generate() -> AsyncIterator[bytes]:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+    }
+    return StreamingResponse(generate(), media_type=content_type, headers=headers)
+
+
+# --- Podcast list (Get Information) persist ---
+
+
+@router.get("/podcasts", response_model=list[PodcastListItem])
+async def list_podcasts(limit: int = 100, offset: int = 0) -> list[PodcastListItem]:
+    """List saved podcasts. Sorted by created_at desc."""
+    capped = min(max(1, limit), _LIST_PAGE_SIZE_MAX)
+    off = max(0, offset)
+    items = podcast_history.list_podcasts(limit=capped, offset=off)
+    return [PodcastListItem(**x) for x in items]
+
+
+@router.post("/podcasts", response_model=PodcastSaveResponse)
+async def save_podcast(req: PodcastSaveRequest) -> PodcastSaveResponse:
+    """Create a new podcast (name + link). Called when user clicks Save."""
+    podcast_id = podcast_history.save_podcast(req.name, req.link)
+    data = podcast_history.get_podcast(podcast_id)
+    if not data:
+        return PodcastSaveResponse(id=podcast_id, created_at=None, name=req.name, link=req.link, rss=None)
+    return PodcastSaveResponse(**data)
+
+
+@router.put("/podcasts/{podcast_id}", response_model=PodcastSaveResponse)
+async def update_podcast(podcast_id: str, req: PodcastUpdateRequest) -> PodcastSaveResponse:
+    """Update podcast name and link (after Edit + Save)."""
+    if not podcast_history.update_podcast(podcast_id, req.name, req.link):
+        raise HTTPException(404, "Not found")
+    data = podcast_history.get_podcast(podcast_id)
+    if not data:
+        raise HTTPException(404, "Not found")
+    return PodcastSaveResponse(**data)
+
+
+@router.patch("/podcasts/{podcast_id}")
+async def update_podcast_rss(podcast_id: str, req: PodcastRssRequest) -> dict:
+    """Update podcast rss (after RSS button). Returns updated podcast."""
+    if not podcast_history.update_podcast_rss(podcast_id, req.rss):
+        raise HTTPException(404, "Not found")
+    data = podcast_history.get_podcast(podcast_id)
+    if not data:
+        raise HTTPException(404, "Not found")
+    return data
+
+
+@router.delete("/podcasts/{podcast_id}", status_code=204)
+async def delete_podcast(podcast_id: str) -> None:
+    """Delete a saved podcast."""
+    if not podcast_history.delete_podcast(podcast_id):
+        raise HTTPException(404, "Not found")

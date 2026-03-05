@@ -17,9 +17,9 @@ def summarize_qwen(text: str) -> str:
 
     model, tokenizer = _get_qwen_model()
     prompt = (
-        "Summarize the following content in the same language as the input. "
-        "Be concise but cover the key ideas, arguments, and important numbers. "
-        "Output ONLY the summary, no explanations or headings.\n\n"
+        "First, generate a concise title for the following content in the same language as the input. "
+        "Then, on a new line, write a summary that is concise but covers the key ideas, arguments, and important numbers. "
+        "Output ONLY the title on the first line and the summary on the following line(s); do not output any other text.\n\n"
         f"{text}"
     )
     inputs = tokenizer(prompt, return_tensors="pt")

@@ -151,15 +151,19 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   background: var(--bg-tint);
   border-radius: 12px;
 }
+.sub-nav-home,
 .sub-nav-link {
   width: 300px;
-  margin: 0; padding-left: 6px;
+  height: 36px;
+  margin: 12px 0 0; padding-left: 6px;
   display: flex; align-items: center; justify-content: flex-start;
   font-size: 24px; font-weight: 400;
   color: var(--primary);
   text-decoration: none;
 }
+.sub-nav-home:hover,
 .sub-nav-link:hover { color: var(--primary-hover); }
+.sub-nav .sub-nav-link { font-size: 18px; height: 36px; }
 .sub-nav-active {
   display: flex; align-items: center;
   width: 300px; height: 36px;
@@ -171,6 +175,11 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   background: var(--bg-tint-strong);
 }
 .sub-nav-active:hover { color: var(--primary-hover); }
+.sub-nav-home.sub-nav-active {
+  margin: 12px 0 0;
+  font-size: 24px;
+  font-weight: 700;
+}
 
 /* === Main Content === */
 .main { flex: 1; min-width: 0; padding: 2rem 2rem 2rem 0; }
@@ -408,12 +417,26 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.step-input.step-podcast-name-input,
+.step-input.step-podcast-link-input {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Podcast inputs: border-bottom only; overridden in .steps-podcasts below */
+.step-podcast-name-input,
+.step-podcast-link-input {
+  border: none;
+  border-bottom: 1px solid var(--border);
+}
 .step-input::placeholder { color: var(--muted); }
 .step-input.step-input-has-file { color: var(--primary); }
 #step-upload-input {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
 }
 .step-input-prefix, .step-input-suffix {
   flex-shrink: 0;
@@ -554,6 +577,133 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   display: flex; align-items: center;
   font-size: 18px; font-weight: 400; white-space: pre;
 }
+.steps-podcasts .step:first-child .step-head {
+  gap: 12px;
+  flex-wrap: nowrap;
+  min-width: 300px;
+  align-items: center;
+}
+.steps-podcasts .step-head img { flex-shrink: 0; display: block; vertical-align: middle; }
+.steps-podcasts .step-title { min-width: 252px; white-space: nowrap; flex-shrink: 0; color: #8554EF; }
+.steps-podcasts .step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: auto;
+  min-height: 0;
+}
+.steps-podcasts .step-body .step-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: none;
+}
+.steps-podcasts .step-body .step-inner {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 36px;
+  border: none;
+  position: relative;
+  z-index: 1;
+}
+.steps-podcasts .step-body .step-inner .step-input {
+  min-width: 0;
+  border-radius: 0;
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input,
+.steps-podcasts .step-body .step-inner .step-podcast-link-input {
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--primary);
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input {
+  padding-right: 12px;
+  margin-right: 12px;
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input:focus,
+.steps-podcasts .step-body .step-inner .step-podcast-link-input:focus {
+  outline: none;
+  border-bottom: 1px solid var(--primary);
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input:disabled,
+.steps-podcasts .step-body .step-inner .step-podcast-link-input:disabled {
+  background: var(--addon-fill-light);
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input.podcast-input-error,
+.steps-podcasts .step-body .step-inner .step-podcast-link-input.podcast-input-error {
+  border-bottom-color: #dc2626;
+}
+.steps-podcasts .step-body .step-inner .step-podcast-name-input.podcast-input-error::placeholder,
+.steps-podcasts .step-body .step-inner .step-podcast-link-input.podcast-input-error::placeholder {
+  color: #dc2626;
+}
+.steps-podcasts .step-body .step-podcast-name-input { flex: 2 2 0; }
+.steps-podcasts .step-body .step-podcast-link-input { flex: 3 3 0; }
+.step-podcast-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.step-podcast-add-row-spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.step-podcast-add-row .step-podcast-add-row-placeholder {
+  width: 72px;
+  flex-shrink: 0;
+  display: block;
+}
+.step-podcast-add,
+.step-podcast-save,
+.step-podcast-delete,
+.step-podcast-preview,
+.step-podcast-rss {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.step-podcast-add:hover,
+.step-podcast-save:hover,
+.step-podcast-delete:hover,
+.step-podcast-preview:hover,
+.step-podcast-rss:hover {
+  background: transparent;
+}
+.step-podcast-add:hover img,
+.step-podcast-save:hover img,
+.step-podcast-delete:hover img,
+.step-podcast-preview:hover img,
+.step-podcast-rss:hover img {
+  filter: brightness(0.8);
+}
+.step-podcast-preview:disabled,
+.step-podcast-rss:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.step-podcast-add-icon,
+.step-podcast-save-icon,
+.step-podcast-delete-icon,
+.step-podcast-preview-icon,
+.step-podcast-rss-icon {
+  width: 24px;
+  height: 24px;
+  display: block;
+  object-fit: contain;
+}
 
 /* === History === */
 .history-files {
@@ -668,12 +818,35 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   white-space: nowrap;
 }
 
+/* In preview dialogs (e.g. podcast Episodes), constrain title width explicitly */
+.confirm-dialog-preview .history-item-name {
+  flex: 0 1 auto;
+  min-width: 160px;
+  max-width: 600px;
+}
+
 .history-item-time {
   flex-shrink: 0;
   margin-right: 12px;
   font-size: 12px;
   color: var(--muted);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.podcast-preview-link {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-right: 12px;
+  font-size: 12px;
+  color: var(--primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.podcast-preview-link:hover {
+  text-decoration: underline;
 }
 
 /* Checkboxes in restructure dialog: fixed size + primary blue */
@@ -727,6 +900,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .history-item-edit,
 .history-item-summarize,
 .history-item-download,
+.history-item-split,
+.history-item-transcribe,
 .history-item-translate,
 .history-item-delete,
 .history-item-wechat,
@@ -747,6 +922,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .history-item-edit:disabled,
 .history-item-summarize:disabled,
 .history-item-download:disabled,
+.history-item-split:disabled,
+.history-item-transcribe:disabled,
 .history-item-translate:disabled,
 .history-item-delete:disabled,
 .history-item-wechat:disabled,
@@ -757,6 +934,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .history-item-edit img,
 .history-item-summarize img,
 .history-item-download img,
+.history-item-split img,
+.history-item-transcribe img,
 .history-item-translate img,
 .history-item-delete img,
 .history-item-wechat img,
@@ -768,6 +947,7 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .history-item-edit:hover img,
 .history-item-summarize:hover img,
 .history-item-download:hover img,
+.history-item-split:hover img,
 .history-item-translate:hover img,
 .history-item-delete:hover img,
 .history-item-wechat:hover img,
@@ -777,6 +957,7 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .history-item-edit:hover,
 .history-item-summarize:hover,
 .history-item-download:hover,
+.history-item-split:hover,
 .history-item-translate:hover,
 .history-item-delete:hover,
 .history-item-wechat:hover,
@@ -799,6 +980,7 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
     flex-wrap: wrap;
     background: #fff;
   }
+  .sub-nav-home,
   .sub-nav-link {
     margin: 0;
     padding: 12px 16px;
@@ -809,6 +991,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
     display: inline-flex; align-items: center;
     transition: background 0.15s, color 0.15s;
   }
+  .sub-nav .sub-nav-link { font-size: 16px; }
+  .sub-nav-home:hover,
   .sub-nav-link:hover {
     background: var(--bg-tint);
   }
@@ -825,6 +1009,10 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   .sub-nav-active:hover {
     background: var(--bg-tint-strong);
   }
+  .sub-nav-home.sub-nav-active {
+    margin: 0;
+    font-size: 16px;
+  }
   .main { padding-left: 60px; }
 }
 @media (max-width: 768px) {
@@ -832,7 +1020,9 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   .notice { left: 48px; top: 110px; }
   .main { padding: 2rem 1rem 1rem; }
   .sub-nav { padding: 12px 16px; }
-  .sub-nav-link, .sub-nav-active { padding: 8px 12px; min-height: 40px; font-size: 15px; }
+  .sub-nav-home, .sub-nav-link, .sub-nav-active { padding: 8px 12px; min-height: 40px; font-size: 15px; }
+  .sub-nav .sub-nav-link { font-size: 15px; }
+  .sub-nav-home.sub-nav-active { margin: 0; font-size: 15px; }
 }
 
 /* === Confirm dialog === */
@@ -851,6 +1041,11 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .confirm-dialog-restructure {
   width: 96%;
   min-width: 960px;
+  display: flex;
+  flex-direction: column;
+}
+.confirm-dialog-restructure .step-body {
+  margin-top: 0;
 }
 .confirm-dialog-preview {
   width: 88%;
@@ -862,6 +1057,9 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
 .preview-dialog-body {
   flex: 1 1 auto;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .preview-loading {
   margin: 0;
@@ -869,6 +1067,8 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   font-size: 14px;
 }
 .preview-textarea {
+  flex: 1 1 auto;
+  min-height: 0;
   width: 100%;
   box-sizing: border-box;
   padding: 12px;
@@ -880,6 +1080,7 @@ body { margin: 0; font-family: Verdana, sans-serif; background: #fff; color: #11
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg-tint);
+  overflow: auto;
 }
 .confirm-text { margin: 0 0 1.25rem; font-size: 1rem; color: var(--primary); }
 .confirm-actions { display: flex; gap: 0.75rem; justify-content: flex-end; }

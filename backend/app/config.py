@@ -22,8 +22,8 @@ ALLOWED_AUDIO_PREFIXES = ("audio/", "application/octet-stream")
 # Max audio size in bytes for transcribe endpoint (e.g. 25MB for Whisper)
 MAX_TRANSCRIBE_BYTES = int(os.environ.get("MAX_TRANSCRIBE_BYTES", str(25 * 1024 * 1024)))
 
-# Max file upload size in bytes (server-wide cap for user uploads; e.g. 100MB)
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+# Max file upload size in bytes (server-wide cap for user uploads; e.g. 300MB)
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(300 * 1024 * 1024)))
 
 # Upload TTL: unconsumed uploads expire after this many seconds (default 1 hour)
 UPLOAD_TTL_SECONDS = int(os.environ.get("UPLOAD_TTL_SECONDS", "3600"))

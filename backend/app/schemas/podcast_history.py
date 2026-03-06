@@ -48,3 +48,5 @@ class PodcastFeedAudioItem(BaseModel):
     url: str = Field(..., description="Audio file URL")
     title: str | None = Field(None, description="Episode title from feed")
     pub_date: str | None = Field(None, description="Publication date from feed")
+    duration_seconds: int | None = Field(None, description="Episode duration in seconds (from itunes:duration)")
+    length_bytes: int | None = Field(None, description="Enclosure file size in bytes (from enclosure length)")

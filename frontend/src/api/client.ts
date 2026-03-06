@@ -12,6 +12,7 @@ function getApiHeaders(): Record<string, string> {
 
 export interface UploadConfig {
   max_upload_bytes: number;
+  upload_ttl_seconds: number;
 }
 
 export async function getUploadConfig(
@@ -156,6 +157,86 @@ export async function getUploadDuration(
     throw new Error(await getErrorMessageFromResponse(res, "Get duration failed"));
   }
   return res.json();
+}
+
+/** Returns true if upload exists, false if 404/500 (deleted, expired, or file missing on server). Use to sync with server after admin delete. */
+export async function checkUploadExists(
+  uploadId: string,
+  options?: { signal?: AbortSignal }
+): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/upload/${encodeURIComponent(uploadId)}/duration`, {
+    headers: getApiHeaders(),
+    signal: options?.signal,
+  });
+  if (res.status === 404) return false;
+  if (res.status === 500) return false;
+  if (!res.ok) throw new Error(await getErrorMessageFromResponse(res, "Check upload failed"));
+  return true;
+}
+
+/** Upload podcast episode audio by URL (backend fetches; avoids CORS). Returns upload_id.
+ * If onProgress is provided, uses NDJSON stream and calls onProgress(percent 0..100) when expectedSize is set. */
+export async function uploadFromUrl(
+  audioUrl: string,
+  filename: string,
+  options?: {
+    signal?: AbortSignal;
+    expectedSize?: number | null;
+    onProgress?: (percent: number) => void;
+  }
+): Promise<{ upload_id: string; duration_seconds?: number | null }> {
+  const streamProgress = options?.onProgress != null;
+  const body: { url: string; filename: string; stream_progress?: boolean; expected_size?: number | null } = {
+    url: audioUrl,
+    filename,
+  };
+  if (streamProgress) {
+    body.stream_progress = true;
+    if (options?.expectedSize != null && options.expectedSize > 0) body.expected_size = options.expectedSize;
+  }
+
+  const res = await fetch(`${API_BASE}/api/podcast/upload-from-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getApiHeaders() },
+    body: JSON.stringify(body),
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    throw new Error(await getErrorMessageFromResponse(res, "Upload from URL failed"));
+  }
+
+  if (!streamProgress) return res.json();
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const total = options?.expectedSize ?? 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let obj: { type: string; bytes?: number; total?: number; upload_id?: string; duration_seconds?: number | null; message?: string };
+      try {
+        obj = JSON.parse(line) as typeof obj;
+      } catch {
+        continue;
+      }
+      if (obj.type === "progress" && obj.bytes != null && options?.onProgress) {
+        const pct = total > 0 ? Math.min(100, Math.round((obj.bytes / total) * 100)) : 0;
+        options.onProgress(pct);
+      } else if (obj.type === "done" && obj.upload_id) {
+        return { upload_id: obj.upload_id, duration_seconds: obj.duration_seconds ?? null };
+      } else if (obj.type === "error" && obj.message) {
+        throw new Error(obj.message);
+      }
+    }
+  }
+  throw new Error("Upload stream ended without done event");
 }
 
 export async function splitStream(
@@ -757,6 +838,8 @@ export interface PodcastFeedAudioItem {
   url: string;
   title?: string | null;
   pub_date?: string | null;
+  duration_seconds?: number | null;
+  length_bytes?: number | null;
 }
 
 export async function getPodcastFeedAudioLinks(

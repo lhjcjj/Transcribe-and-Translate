@@ -25,7 +25,17 @@ class UploadDurationResponse(BaseModel):
 class UploadConfigResponse(BaseModel):
     """Public upload limits (single source of truth; backend config)."""
 
-    max_upload_bytes: int = Field(..., description="Max upload size in bytes (e.g. 100MB)")
+    max_upload_bytes: int = Field(..., description="Max upload size in bytes (e.g. 300MB)")
+    upload_ttl_seconds: int = Field(..., description="Upload expiry in seconds; after this the file is cleaned and may be re-uploaded")
+
+
+class UploadFromUrlRequest(BaseModel):
+    """Request body for POST /api/podcast/upload-from-url."""
+
+    url: str = Field(..., description="Audio URL to fetch and store as upload")
+    filename: str | None = Field(None, description="Optional display filename (sanitized); inferred from URL if omitted")
+    expected_size: int | None = Field(None, description="Expected size in bytes (from RSS); used for progress when stream_progress=True")
+    stream_progress: bool = Field(False, description="If True, response is NDJSON stream with progress events and final done")
 
 
 class SplitRequest(BaseModel):

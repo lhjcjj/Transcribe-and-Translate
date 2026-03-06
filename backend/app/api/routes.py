@@ -27,6 +27,7 @@ from app.schemas.upload import (
     UploadChunkItem,
     UploadConfigResponse,
     UploadDurationResponse,
+    UploadFromUrlRequest,
     UploadResponse,
 )
 from app.api.upload_store import (
@@ -197,13 +198,16 @@ def _record_failed_chunk(
 
 @router.get("/config", response_model=UploadConfigResponse)
 def get_upload_config() -> UploadConfigResponse:
-    """Return upload limits so the frontend can validate without duplicating backend config."""
-    return UploadConfigResponse(max_upload_bytes=config.MAX_UPLOAD_BYTES)
+    """Return upload limits and TTL so the frontend can validate and re-enable upload after expiry."""
+    return UploadConfigResponse(
+        max_upload_bytes=config.MAX_UPLOAD_BYTES,
+        upload_ttl_seconds=config.UPLOAD_TTL_SECONDS,
+    )
 
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload(req: Request, audio: UploadFile = File(...)) -> UploadResponse:
-    """Upload an audio file (step 1). Saves file only; call POST /api/split with upload_id to split. Max size MAX_UPLOAD_BYTES (e.g. 100MB)."""
+    """Upload an audio file (step 1). Saves file only; call POST /api/split with upload_id to split. Max size MAX_UPLOAD_BYTES (e.g. 300MB)."""
     if not allowed_audio_content_type(audio.content_type):
         raise HTTPException(400, "Invalid file type: audio only")
 
@@ -246,6 +250,9 @@ async def get_upload_duration(upload_id: str) -> UploadDurationResponse:
     if not entry:
         raise HTTPException(404, "Upload not found or already consumed")
     temp_path, filename = entry
+    if not os.path.exists(temp_path):
+        pop_upload(upload_id)
+        raise HTTPException(404, "Upload not found or already consumed")
     try:
         duration_seconds = audio_split_svc.get_audio_duration_seconds(temp_path, filename)
         return UploadDurationResponse(duration_seconds=duration_seconds)
@@ -1048,8 +1055,28 @@ async def get_podcast_rss(link: str) -> dict:
     return {"feedUrl": feed_url}
 
 
+def _parse_itunes_duration(s: str) -> int | None:
+    """Parse itunes:duration string to seconds. Supports '123', '45:30', '1:23:45'. Returns None if invalid."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    try:
+        if len(parts) == 1:
+            return int(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        if len(parts) == 4:
+            return int(parts[0]) * 86400 + int(parts[1]) * 3600 + int(parts[2]) * 60 + int(parts[3])
+    except ValueError:
+        pass
+    return None
+
+
 def _parse_rss_audio_enclosures(xml_text: str) -> list[dict]:
-    """Parse RSS/Atom XML and return list of {url, title?, pub_date?} for all enclosures (same as regex url=\"...\")."""
+    """Parse RSS/Atom XML and return list of {url, title?, pub_date?, duration_seconds?} for all enclosures."""
     out: list[dict] = []
     try:
         root = ET.fromstring(xml_text)
@@ -1088,17 +1115,29 @@ def _parse_rss_audio_enclosures(xml_text: str) -> list[dict]:
             continue
         title = text_of(elem, "title")
         pub_date = text_of(elem, "pubDate") or text_of(elem, "published") or text_of(elem, "updated")
+        duration_raw = text_of(elem, "duration")
+        duration_seconds = _parse_itunes_duration(duration_raw) if duration_raw else None
         for c in elem:
             if local_tag(c) != "enclosure":
                 continue
             url = c.get("url") or c.get("href")
             if not url or not url.strip():
                 continue
-            # Same as regex approach: extract every enclosure url (no type filter)
+            length_raw = c.get("length")
+            length_bytes: int | None = None
+            if length_raw is not None and str(length_raw).strip():
+                try:
+                    n = int(length_raw)
+                    if n > 0:
+                        length_bytes = n
+                except ValueError:
+                    pass
             out.append({
                 "url": url.strip(),
                 "title": title,
                 "pub_date": pub_date,
+                "duration_seconds": duration_seconds,
+                "length_bytes": length_bytes,
             })
     return out
 
@@ -1170,6 +1209,105 @@ async def download_podcast_audio(url: str, filename: str | None = None) -> Strea
         "Content-Disposition": f'attachment; filename="{safe_filename}"',
     }
     return StreamingResponse(generate(), media_type=content_type, headers=headers)
+
+
+async def _stream_upload_from_url(
+    url: str,
+    safe_filename: str,
+    expected_size: int | None,
+) -> AsyncIterator[str]:
+    """Yield NDJSON lines: progress (bytes, total) then done (upload_id) or error (message)."""
+    PROGRESS_INTERVAL = 256 * 1024  # 256KB
+    chunks: list[bytes] = []
+    total = 0
+    last_yielded = 0
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes():
+                    total += len(chunk)
+                    if total > config.MAX_UPLOAD_BYTES:
+                        yield json.dumps({
+                            "type": "error",
+                            "message": f"Remote audio is too large (max {config.MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                        }) + "\n"
+                        return
+                    chunks.append(chunk)
+                    if total - last_yielded >= PROGRESS_INTERVAL:
+                        yield json.dumps({"type": "progress", "bytes": total, "total": expected_size or 0}) + "\n"
+                        last_yielded = total
+        body_bytes = b"".join(chunks)
+        if len(body_bytes) == 0:
+            yield json.dumps({"type": "error", "message": "Empty file from URL"}) + "\n"
+            return
+        try:
+            upload_id = save_upload_bytes(body_bytes, safe_filename)
+        except StoreFullError:
+            yield json.dumps({"type": "error", "message": "Upload store full. Try again later."}) + "\n"
+            return
+        yield json.dumps({"type": "done", "upload_id": upload_id, "duration_seconds": None}) + "\n"
+    except httpx.HTTPStatusError as e:
+        yield json.dumps({"type": "error", "message": str(e) or "HTTP error"}) + "\n"
+    except Exception as e:
+        yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+
+
+@router.post("/podcast/upload-from-url")
+async def upload_podcast_from_url(body_req: UploadFromUrlRequest):
+    """Fetch podcast episode audio from URL and store as upload (avoids CORS).
+    If stream_progress=True, response is NDJSON stream (progress then done/error).
+    Otherwise returns JSON { upload_id, duration_seconds }."""
+    url = (body_req.url or "").strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(400, "url must be http or https")
+
+    if body_req.filename and body_req.filename.strip():
+        name = body_req.filename.strip()
+        lower = name.lower()
+        if not any(lower.endswith(ext) for ext in (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus")):
+            name = f"{name}.mp3"
+        name = ("".join(FILENAME_ALLOWED_PATTERN.findall(name))).strip() or "audio.mp3"
+        if len(name) > FILENAME_MAX_LENGTH:
+            name = name[:FILENAME_MAX_LENGTH].rstrip() or "audio.mp3"
+        safe_filename = name
+    else:
+        safe_filename = _sanitize_download_filename_from_url(url)
+
+    expected_size = body_req.expected_size if (body_req.expected_size and body_req.expected_size > 0) else None
+
+    if body_req.stream_progress:
+        async def ndjson_stream() -> AsyncIterator[bytes]:
+            async with upload_semaphore:
+                async for line in _stream_upload_from_url(url, safe_filename, expected_size):
+                    yield line.encode("utf-8")
+
+        return StreamingResponse(ndjson_stream(), media_type="application/x-ndjson")
+
+    async with upload_semaphore:
+        chunks: list[bytes] = []
+        total = 0
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes():
+                    total += len(chunk)
+                    if total > config.MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            413,
+                            f"Remote audio is too large (max {config.MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                        )
+                    chunks.append(chunk)
+        body_bytes = b"".join(chunks)
+        if len(body_bytes) == 0:
+            raise HTTPException(400, "Empty file from URL")
+        try:
+            upload_id = save_upload_bytes(body_bytes, safe_filename)
+        except StoreFullError:
+            raise HTTPException(503, "Upload store full. Try again later.")
+        return UploadResponse(upload_id=upload_id, duration_seconds=None)
 
 
 # --- Podcast list (Get Information) persist ---

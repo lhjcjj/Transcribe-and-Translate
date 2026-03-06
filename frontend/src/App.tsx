@@ -19,6 +19,7 @@ import {
   updatePodcast,
   updatePodcastRss,
   getUploadConfig,
+  checkUploadExists,
   getUploadDuration,
   listSummaries,
   listTranscriptions,
@@ -32,6 +33,7 @@ import {
   transcribeByUploadIdsStream,
   translate,
   upload,
+  uploadFromUrl,
   TranscribeApiResult,
   TranscribeEngine,
   TranscriptionListItem,
@@ -43,6 +45,7 @@ import {
 } from "./api/client";
 import deleteIcon from "./assets/icons/delete-icon.svg";
 import downloadIcon from "./assets/icons/download-icon.svg";
+import uploadIcon from "./assets/icons/upload-icon.svg";
 import splitIcon from "./assets/icons/split-icon.svg";
 import transcribeIcon from "./assets/icons/transcribe-icon.svg";
 import summarizeIcon from "./assets/icons/summarize-icon.svg";
@@ -54,6 +57,9 @@ import editIcon from "./assets/icons/edit-icon.svg";
 import saveIcon from "./assets/icons/save-icon.svg";
 import previewIcon from "./assets/icons/preview-icon.svg";
 import rssIcon from "./assets/icons/rss-icon.svg";
+import rssInlineIcon from "./assets/icons/RSS-inline-icon.svg";
+import newsIcon from "./assets/icons/news-icon.svg";
+import linkIcon from "./assets/icons/link-icon.svg";
 import { FileUpload } from "./components/FileUpload";
 import { TranscribeResult } from "./components/TranscribeResult";
 import { useSplitFlow } from "./hooks/useSplitFlow";
@@ -61,7 +67,7 @@ import { useSplitFlow } from "./hooks/useSplitFlow";
 /** UI display threshold (MB): show split hint when file exceeds this. Actual limit from API. */
 const DISPLAY_SPLIT_THRESHOLD_MB = 25;
 /** UI display cap (MB): show ">N MB" when file exceeds this. Actual limit from API. */
-const DISPLAY_UPLOAD_MAX_MB = 100;
+const DISPLAY_UPLOAD_MAX_MB = 300;
 
 /** Chunk size input clamp (minutes). */
 const CHUNK_SIZE_MIN = 1;
@@ -140,6 +146,22 @@ function formatPubDate(pubDate: string | null | undefined): string {
   const min = String(d.getMinutes()).padStart(2, "0");
   const s = String(d.getSeconds()).padStart(2, "0");
   return `${y}-${mo}-${day} ${h}:${min}:${s}`;
+}
+
+/** Format duration in seconds as hh:mm:ss. */
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+/** Format file size in bytes as human-readable string (e.g. "50.0 MB"). */
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /** Remove common audio/file extensions from display name (e.g. .mp3, .wav). */
@@ -266,8 +288,18 @@ export default function App() {
   const [uploadFileName, setUploadFileName] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadId, setUploadId] = useState<string | null>(null);
+  const uploadIdRef = useRef<string | null>(null);
+  /** File size in bytes when current upload is from episode (RSS length_bytes); used to show MB in step 1. */
+  const [uploadSizeBytes, setUploadSizeBytes] = useState<number | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadingEpisodeUrl, setUploadingEpisodeUrl] = useState<string | null>(null);
+  /** Episode URL -> { uploadedAt, uploadId }. Upload expires after uploadTtlMs or if server deletes file; then button re-enables. */
+  const [uploadedEpisodeUrls, setUploadedEpisodeUrls] = useState<Map<string, { uploadedAt: number; uploadId: string }>>(new Map());
+  /** When user deletes/clears this upload, we remove that episode from uploadedEpisodeUrls so the button re-enables. */
+  const [uploadIdToEpisodeUrl, setUploadIdToEpisodeUrl] = useState<Map<string, string>>(new Map());
+  const episodeUploadIdRef = useRef<string | null>(null);
+  const [uploadTtlMs, setUploadTtlMs] = useState<number>(3600 * 1000); // default 1h; from backend config
   const [chunkSizeInput, setChunkSizeInput] = useState("5");
   const chunkSizeDebounced = useDebouncedValue(chunkSizeInput, CHUNK_SIZE_DEBOUNCE_MS);
   const [splitChunkIds, setSplitChunkIds] = useState<string[] | null>(null);
@@ -365,10 +397,92 @@ export default function App() {
   const [previewText, setPreviewText] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [podcastPreviewOpen, setPodcastPreviewOpen] = useState(false);
+  const [podcastPreviewFeedUrl, setPodcastPreviewFeedUrl] = useState<string>("");
   const [podcastPreviewLoading, setPodcastPreviewLoading] = useState(false);
-  const [podcastPreviewLinks, setPodcastPreviewLinks] = useState<{ url: string; title?: string | null; pub_date?: string | null }[]>([]);
+  const [podcastPreviewLinks, setPodcastPreviewLinks] = useState<{ url: string; title?: string | null; pub_date?: string | null; duration_seconds?: number | null; length_bytes?: number | null }[]>([]);
   const [podcastPreviewSelectedIndices, setPodcastPreviewSelectedIndices] = useState<number[]>([]);
+  const [podcastPreviewNewUrls, setPodcastPreviewNewUrls] = useState<Set<string>>(new Set());
+  const PODCAST_PREVIEW_CACHE_TTL_MS = 60 * 60 * 1000; // 60 minutes
+  const PODCAST_PREVIEW_NEW_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours for "new" badge
+  const PODCAST_PREVIEW_NEW_STORAGE_KEY = "podcast-preview-new-episodes";
+  const podcastPreviewCacheRef = useRef<{ feedUrl: string; links: { url: string; title?: string | null; pub_date?: string | null; duration_seconds?: number | null; length_bytes?: number | null }[]; cachedAt: number } | null>(null);
+
+  const getStoredNewUrlsForFeed = (feedUrl: string, currentLinkUrls: string[]): Set<string> => {
+    try {
+      const raw = localStorage.getItem(PODCAST_PREVIEW_NEW_STORAGE_KEY);
+      if (!raw) return new Set();
+      const data = JSON.parse(raw) as Record<string, Record<string, number>>;
+      const byFeed = data[feedUrl];
+      if (!byFeed || typeof byFeed !== "object") return new Set();
+      const now = Date.now();
+      const out = new Set<string>();
+      for (const url of currentLinkUrls) {
+        const ts = byFeed[url];
+        if (typeof ts === "number" && now - ts < PODCAST_PREVIEW_NEW_TTL_MS) out.add(url);
+      }
+      return out;
+    } catch {
+      return new Set();
+    }
+  };
+
+  const persistNewUrlsForFeed = (feedUrl: string, newUrls: string[]): void => {
+    if (newUrls.length === 0) return;
+    try {
+      const raw = localStorage.getItem(PODCAST_PREVIEW_NEW_STORAGE_KEY);
+      const data: Record<string, Record<string, number>> = raw ? JSON.parse(raw) : {};
+      if (!data[feedUrl]) data[feedUrl] = {};
+      const now = Date.now();
+      for (const url of newUrls) {
+        const existing = data[feedUrl][url];
+        if (existing == null || now - existing >= PODCAST_PREVIEW_NEW_TTL_MS) data[feedUrl][url] = now;
+      }
+      localStorage.setItem(PODCAST_PREVIEW_NEW_STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const hasNewEpisodesForFeed = (feedUrl: string): boolean => {
+    if (!feedUrl?.trim()) return false;
+    try {
+      const raw = localStorage.getItem(PODCAST_PREVIEW_NEW_STORAGE_KEY);
+      if (!raw) return false;
+      const data = JSON.parse(raw) as Record<string, Record<string, number>>;
+      const byFeed = data[feedUrl.trim()];
+      if (!byFeed || typeof byFeed !== "object") return false;
+      const now = Date.now();
+      for (const ts of Object.values(byFeed)) {
+        if (typeof ts === "number" && now - ts < PODCAST_PREVIEW_NEW_TTL_MS) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const [pendingNotionArticleItem, setPendingNotionArticleItem] = useState<ArticleListItem | null>(null);
+
+  const isAnyDialogOpen =
+    confirmCancelType !== null ||
+    previewOpen ||
+    podcastPreviewOpen ||
+    showDownloadDialog ||
+    restructureDialogOpen ||
+    pendingDeleteTranscriptionItem !== null ||
+    pendingDeleteTranslationItem !== null ||
+    pendingDeleteSummaryItem !== null ||
+    pendingDeleteArticleItem !== null ||
+    pendingNotionArticleItem !== null ||
+    pendingSummarizeTranscriptionItem !== null ||
+    pendingSummarizeTranslationItem !== null ||
+    pendingTranslateFromHistoryItem !== null;
+
+  useEffect(() => {
+    if (isAnyDialogOpen) document.body.classList.add("dialog-open");
+    else document.body.classList.remove("dialog-open");
+    return () => document.body.classList.remove("dialog-open");
+  }, [isAnyDialogOpen]);
 
   // If this component ever calls translate(), pass apiAbortRef.current?.signal so the request is aborted on unmount.
   useEffect(() => {
@@ -451,7 +565,10 @@ export default function App() {
     const controller = new AbortController();
     configAbortRef.current = controller;
     getUploadConfig({ signal: controller.signal })
-      .then((c) => setMaxUploadBytes(c.max_upload_bytes))
+      .then((c) => {
+        setMaxUploadBytes(c.max_upload_bytes);
+        setUploadTtlMs((c.upload_ttl_seconds ?? 3600) * 1000);
+      })
       .catch((err) => {
         // Ignore aborts (React strict mode mounts/unmounts effects).
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -461,6 +578,95 @@ export default function App() {
         configAbortRef.current = null;
       });
   }, []);
+
+  /** True if this episode was uploaded and the upload has not yet expired (backend TTL). */
+  const isEpisodeUploadValid = useCallback(
+    (url: string) => {
+      const entry = uploadedEpisodeUrls.get(url);
+      return entry != null && Date.now() - entry.uploadedAt < uploadTtlMs;
+    },
+    [uploadedEpisodeUrls, uploadTtlMs]
+  );
+
+  useEffect(() => {
+    if (!podcastPreviewOpen || uploadedEpisodeUrls.size === 0) return;
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setUploadedEpisodeUrls((prev) => {
+        let changed = false;
+        const next = new Map(prev);
+        next.forEach((entry, url) => {
+          if (now - entry.uploadedAt >= uploadTtlMs) {
+            next.delete(url);
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }, 60 * 1000);
+    return () => clearInterval(interval);
+  }, [podcastPreviewOpen, uploadedEpisodeUrls.size, uploadTtlMs]);
+
+  useEffect(() => {
+    uploadIdRef.current = uploadId;
+  }, [uploadId]);
+
+  /** When episode dialog opens, probe server for each "uploaded" episode; remove if file was deleted (e.g. by admin). Skip the current main upload so we never treat a just-finished upload as deleted (avoids race / multi-instance 404). */
+  useEffect(() => {
+    if (!podcastPreviewOpen || podcastPreviewLinks.length === 0 || uploadedEpisodeUrls.size === 0) return;
+    const controller = new AbortController();
+    const links = podcastPreviewLinks;
+    const mapSnapshot = new Map(uploadedEpisodeUrls);
+    const currentId = uploadIdRef.current;
+    const urlsToCheck = links.map((a) => a.url).filter((url) => mapSnapshot.has(url));
+    if (urlsToCheck.length === 0) return;
+    Promise.all(
+      urlsToCheck.map(async (url): Promise<{ url: string; uploadId: string } | null> => {
+        const entry = mapSnapshot.get(url);
+        if (!entry || Date.now() - entry.uploadedAt >= uploadTtlMs) return null;
+        if (entry.uploadId === currentId) return null;
+        try {
+          const exists = await checkUploadExists(entry.uploadId, { signal: controller.signal });
+          if (!exists) return { url, uploadId: entry.uploadId };
+        } catch {
+          /* leave entry as-is on network error */
+        }
+        return null;
+      })
+    ).then((results) => {
+      const toRemove = results.filter((r): r is { url: string; uploadId: string } => r != null);
+      if (toRemove.length === 0) return;
+      const removedIds = new Set(toRemove.map((r) => r.uploadId));
+      const currentUploadId = uploadIdRef.current;
+      const shouldResetMain = currentUploadId != null && removedIds.has(currentUploadId);
+      setUploadedEpisodeUrls((prev) => {
+        const next = new Map(prev);
+        toRemove.forEach(({ url }) => next.delete(url));
+        return next.size === prev.size ? prev : next;
+      });
+      setUploadIdToEpisodeUrl((prev) => {
+        const next = new Map(prev);
+        toRemove.forEach(({ uploadId }) => next.delete(uploadId));
+        return next.size === prev.size ? prev : next;
+      });
+      if (shouldResetMain) {
+        setUploadId(null);
+        setUploadDurationSeconds(null);
+        setUploadSizeBytes(null);
+        setUploadFileName("");
+        setSelectedFile(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        setSplitChunkIds(null);
+        setFailedChunkIds(null);
+        setFailedChunkIndices(null);
+        setTranscribeSegments(null);
+        setTranscribeText(null);
+        setTranscribeError(null);
+        episodeUploadIdRef.current = null;
+      }
+    });
+    return () => controller.abort();
+  }, [podcastPreviewOpen, podcastPreviewFeedUrl, podcastPreviewLinks, uploadedEpisodeUrls, uploadTtlMs]);
 
   const chunkSizeMin = useMemo(
     () =>
@@ -482,8 +688,20 @@ export default function App() {
     ],
   );
   const clearUploadState = useCallback(() => {
+    const id = episodeUploadIdRef.current;
+    if (id) {
+      episodeUploadIdRef.current = null;
+      setUploadIdToEpisodeUrl((prev) => {
+        const url = prev.get(id);
+        if (url) setUploadedEpisodeUrls((u) => { const n = new Map(u); n.delete(url); return n; });
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
+    }
     setUploadId(null);
     setUploadDurationSeconds(null);
+    setUploadSizeBytes(null);
   }, []);
   const clearFileSelection = useCallback(() => {
     setUploadFileName("");
@@ -512,8 +730,13 @@ export default function App() {
     [splitChunkIds]
   );
   const fileSizeMB = useMemo(
-    () => (selectedFile ? Math.round(selectedFile.size / (1024 * 1024)) : null),
-    [selectedFile]
+    () =>
+      selectedFile
+        ? Math.round(selectedFile.size / (1024 * 1024))
+        : uploadSizeBytes != null
+          ? Math.round(uploadSizeBytes / (1024 * 1024))
+          : null,
+    [selectedFile, uploadSizeBytes]
   );
   const fileTooBig = useMemo(
     () =>
@@ -538,11 +761,12 @@ export default function App() {
   );
   const splitStepDisabled = useMemo(
     () =>
+      isUploading ||
       !isUploaded ||
       isDeletingUpload ||
       uploadDurationSeconds == null ||
       (isTranscribing && !hasChunks),
-    [isUploaded, isDeletingUpload, uploadDurationSeconds, isTranscribing, hasChunks]
+    [isUploading, isUploaded, isDeletingUpload, uploadDurationSeconds, isTranscribing, hasChunks]
   );
   const canTranscribe = useMemo(
     () => hasChunks || (isUploaded && !fileOver25MB),
@@ -566,14 +790,12 @@ export default function App() {
   }, [isSplitting, splitProgress, hasChunks, splitChunkIds, segmentCount]);
   const fileSizeAddonSuffix = useMemo(
     () =>
-      selectedFile == null
-        ? "MB:%"
-        : isUploading && uploadProgress != null
-          ? `MB: ${uploadProgress}%`
-          : isUploaded
-            ? "MB: 100%"
-            : "MB:%",
-    [selectedFile, isUploading, uploadProgress, isUploaded]
+      isUploading && uploadProgress != null
+        ? `MB: ${uploadProgress}%`
+        : isUploaded
+          ? "MB: 100%"
+          : "MB:%",
+    [isUploading, uploadProgress, isUploaded]
   );
   const fileSizeAddon = useMemo(
     () =>
@@ -590,7 +812,7 @@ export default function App() {
           {fileSizeAddonSuffix}
         </>
       ) : (
-        "MB:%"
+        fileSizeAddonSuffix
       ),
     [fileSizeMB, fileSizeAddonSuffix]
   );
@@ -598,6 +820,14 @@ export default function App() {
   const deleteUploadAndClearUploadState = useCallback(
     async (idToDelete: string | null) => {
       if (idToDelete) {
+        if (episodeUploadIdRef.current === idToDelete) episodeUploadIdRef.current = null;
+        setUploadIdToEpisodeUrl((prev) => {
+          const url = prev.get(idToDelete);
+          if (url) setUploadedEpisodeUrls((u) => { const n = new Map(u); n.delete(url); return n; });
+          const next = new Map(prev);
+          next.delete(idToDelete);
+          return next;
+        });
         try {
           await deleteUpload(idToDelete, {
             signal: apiAbortRef.current?.signal ?? undefined,
@@ -689,13 +919,8 @@ export default function App() {
     [confirmCancelType, uploadId, deleteUploadAndClearUploadState, clearFileSelection, clearUploadState]
   );
 
-  const handleUploadOrCancel = useCallback(
-    async () => {
-      if (isUploading) {
-        setConfirmCancelType("upload");
-        return;
-      }
-      if (!selectedFile) return;
+  const uploadFileToTranscribe = useCallback(
+    async (file: File) => {
       uploadGenerationRef.current += 1;
       const uploadGeneration = uploadGenerationRef.current;
       const controller = new AbortController();
@@ -709,12 +934,15 @@ export default function App() {
         setFailedChunkIds(null);
         setFailedChunkIndices(null);
         setTranscribeSegments(null);
-        const res = await upload(selectedFile, {
+        const res = await upload(file, {
           signal: controller.signal,
           onProgress: (p) => setUploadProgress(p.percent),
         });
         setUploadId(res.upload_id);
+        setUploadFileName(file.name);
         setIsCancellingSplit(false);
+        episodeUploadIdRef.current = null;
+        setUploadSizeBytes(null);
         if (res.duration_seconds != null) {
           setUploadDurationSeconds(res.duration_seconds);
           setUploadProgress(100);
@@ -722,13 +950,13 @@ export default function App() {
           setUploadProgress(null);
         } else {
           setUploadProgress(99);
-          const controller = new AbortController();
-          durationAbortRef.current = controller;
+          const durationController = new AbortController();
+          durationAbortRef.current = durationController;
           const fetchDuration = async () => {
             for (let attempt = 0; attempt < DURATION_FETCH_MAX_ATTEMPTS; attempt++) {
               try {
                 const d = await getUploadDuration(res.upload_id, {
-                  signal: controller.signal,
+                  signal: durationController.signal,
                 });
                 if (uploadGenerationRef.current !== uploadGeneration) return;
                 setUploadDurationSeconds(d.duration_seconds);
@@ -766,7 +994,108 @@ export default function App() {
         uploadAbortRef.current = null;
       }
     },
-    [isUploading, selectedFile, splitChunkIds, failedChunkIds]
+    [splitChunkIds, failedChunkIds]
+  );
+
+  const uploadFromUrlToTranscribe = useCallback(
+    async (url: string, filename: string, lengthBytes?: number | null) => {
+      uploadGenerationRef.current += 1;
+      const uploadGeneration = uploadGenerationRef.current;
+      const controller = new AbortController();
+      uploadAbortRef.current = controller;
+      setIsUploading(true);
+      setUploadProgress(0);
+      setUploadingEpisodeUrl(url);
+      setUploadFileName(filename);
+      setUploadSizeBytes(lengthBytes ?? null);
+      setUploadId(null);
+      setUploadDurationSeconds(null);
+      setSplitChunkIds(null);
+      setFailedChunkIds(null);
+      setFailedChunkIndices(null);
+      setTranscribeSegments(null);
+      try {
+        await deleteUploadIds(splitChunkIds, controller.signal);
+        await deleteUploadIds(failedChunkIds, controller.signal);
+        const res = await uploadFromUrl(url, filename, {
+          signal: controller.signal,
+          expectedSize: lengthBytes ?? undefined,
+          onProgress: lengthBytes != null && lengthBytes > 0 ? (pct) => setUploadProgress(pct) : undefined,
+        });
+        setUploadId(res.upload_id);
+        setIsCancellingSplit(false);
+        episodeUploadIdRef.current = res.upload_id;
+        setUploadIdToEpisodeUrl((prev) => new Map(prev).set(res.upload_id, url));
+        if (res.duration_seconds != null) {
+          setUploadDurationSeconds(res.duration_seconds);
+          setUploadProgress(100);
+          setIsUploading(false);
+          setUploadProgress(null);
+          setUploadedEpisodeUrls((prev) => new Map(prev).set(url, { uploadedAt: Date.now(), uploadId: res.upload_id }));
+        } else {
+          setUploadProgress(99);
+          const durationController = new AbortController();
+          durationAbortRef.current = durationController;
+          const fetchDuration = async () => {
+            for (let attempt = 0; attempt < DURATION_FETCH_MAX_ATTEMPTS; attempt++) {
+              try {
+                const d = await getUploadDuration(res.upload_id, {
+                  signal: durationController.signal,
+                });
+                if (uploadGenerationRef.current !== uploadGeneration) return;
+                setUploadDurationSeconds(d.duration_seconds);
+                return;
+              } catch (e) {
+                if (e instanceof Error && e.name === "AbortError") return;
+                if (attempt === DURATION_FETCH_MAX_ATTEMPTS - 1)
+                  throw new Error("Failed to get duration");
+              }
+            }
+          };
+          fetchDuration()
+            .then(() => {
+              if (uploadGenerationRef.current !== uploadGeneration) return;
+              setUploadProgress(100);
+              setIsUploading(false);
+              setUploadProgress(null);
+              setUploadedEpisodeUrls((prev) => new Map(prev).set(url, { uploadedAt: Date.now(), uploadId: res.upload_id }));
+            })
+            .catch(() => {
+              if (uploadGenerationRef.current !== uploadGeneration) return;
+              setIsUploading(false);
+              setUploadProgress(null);
+              setUploadingEpisodeUrl(null);
+              episodeUploadIdRef.current = null;
+              setUploadIdToEpisodeUrl((prev) => { const n = new Map(prev); n.delete(res.upload_id); return n; });
+            })
+            .finally(() => {
+              durationAbortRef.current = null;
+            });
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name !== "AbortError") {
+          reportError("Upload from URL failed", err);
+        }
+        setIsUploading(false);
+        setUploadProgress(null);
+        setUploadingEpisodeUrl(null);
+      } finally {
+        uploadAbortRef.current = null;
+      }
+    },
+    [splitChunkIds, failedChunkIds]
+  );
+
+  const handleUploadOrCancel = useCallback(
+    async () => {
+      if (isUploading) {
+        setConfirmCancelType("upload");
+        return;
+      }
+      if (!selectedFile) return;
+      await uploadFileToTranscribe(selectedFile);
+    },
+    [isUploading, selectedFile, uploadFileToTranscribe]
   );
 
   const handleSplit = useCallback(() => {
@@ -1659,18 +1988,30 @@ export default function App() {
                       {podcastRows.map((row) => (
                         <div key={row.id} className="step-row">
                           <div className="step-inner">
-                            <input
-                              type="text"
-                              id={`step-podcast-name-input-${row.id}`}
-                              name="podcast-name"
-                              className={`step-input step-podcast-name-input${row.showValidationError && !row.name.trim() ? " podcast-input-error" : ""}`}
-                              placeholder="Input a podcast name"
-                              aria-label="Podcast name"
-                              autoComplete="off"
-                              value={row.name}
-                              onChange={(e) => { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, name: e.target.value, showValidationError: false } : r)); }}
-                              disabled={row.inputsDisabled}
-                            />
+                            <div className="step-podcast-name-wrap">
+                              <input
+                                type="text"
+                                id={`step-podcast-name-input-${row.id}`}
+                                name="podcast-name"
+                                className={`step-input step-podcast-name-input${row.showValidationError && !row.name.trim() ? " podcast-input-error" : ""}`}
+                                placeholder="Input a podcast name"
+                                aria-label="Podcast name"
+                                autoComplete="off"
+                                value={row.name}
+                                onChange={(e) => { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, name: e.target.value, showValidationError: false } : r)); }}
+                                disabled={row.inputsDisabled}
+                              />
+                              {hasNewEpisodesForFeed((row.rss || "").trim()) ? (
+                                <span className="step-podcast-name-rss-icon" title="has new episodes" aria-hidden="true" style={{ marginRight: 4 }}>
+                                  <img src={newsIcon} alt="" width={14} height={14} />
+                                </span>
+                              ) : null}
+                              {(row.rss || "").trim() ? (
+                                <span className="step-podcast-name-rss-icon" title="RSS has been fetched" aria-hidden="true">
+                                  <img src={rssInlineIcon} alt="" />
+                                </span>
+                              ) : null}
+                            </div>
                             <input
                               type="text"
                               id={`step-podcast-link-input-${row.id}`}
@@ -1687,7 +2028,7 @@ export default function App() {
                           <div className="step-podcast-actions">
                             <button type="button" className="step-podcast-save" aria-label={row.inputsDisabled ? "Edit podcast" : "Save podcast"} onClick={async () => { if (row.inputsDisabled) { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, inputsDisabled: false } : r)); return; } const nameOk = row.name.trim() !== ""; const linkOk = row.link.trim() !== ""; if (!nameOk || !linkOk) { setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, showValidationError: true } : r)); return; } try { if (row.id.startsWith("new-")) { const res = await savePodcast(row.name, row.link); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, id: res.id, inputsDisabled: true, showValidationError: false } : r)); } else { await updatePodcast(row.id, row.name, row.link); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, inputsDisabled: true, showValidationError: false } : r)); } } catch (e) { alert(e instanceof Error ? e.message : "Save failed"); } }}>{row.inputsDisabled ? <img src={editIcon} alt="" className="step-podcast-save-icon" /> : <img src={saveIcon} alt="" className="step-podcast-save-icon" />}</button>
                             <button type="button" className="step-podcast-rss" aria-label="RSS" disabled={!row.inputsDisabled || !row.name.trim() || !row.link.trim()} onClick={async () => { const link = row.link.trim(); if (!link) { alert("Input podcast link first."); return; } try { const { feedUrl } = await getPodcastRss(link); await updatePodcastRss(row.id, feedUrl); setPodcastRows(prev => prev.map(r => r.id === row.id ? { ...r, rss: feedUrl } : r)); await navigator.clipboard.writeText(feedUrl); alert(`${feedUrl}\n\nRSS has been copied.`); } catch (e) { alert(e instanceof Error ? e.message : "Invalid Apple Podcasts link"); } }}><img src={rssIcon} alt="" className="step-podcast-rss-icon" /></button>
-                            <button type="button" className="step-podcast-preview" aria-label="Preview podcast" disabled={!row.inputsDisabled || !row.name.trim() || !row.link.trim()} onClick={async () => { const link = row.link.trim(); if (!link) return; let feedUrl = (row.rss || "").trim(); if (!feedUrl) { try { const r = await getPodcastRss(link); feedUrl = r.feedUrl; } catch (e) { alert(e instanceof Error ? e.message : "Could not get RSS feed"); return; } } setPodcastPreviewOpen(true); setPodcastPreviewLoading(true); setPodcastPreviewLinks([]); setPodcastPreviewSelectedIndices([]); try { const links = await getPodcastFeedAudioLinks(feedUrl); setPodcastPreviewLinks(links); } catch (e) { setPodcastPreviewLinks([]); alert(e instanceof Error ? e.message : "Failed to fetch audio links"); } finally { setPodcastPreviewLoading(false); } }}>
+                            <button type="button" className="step-podcast-preview" aria-label="Preview podcast" disabled={!row.inputsDisabled || !row.name.trim() || !row.link.trim()} onClick={async () => { const link = row.link.trim(); if (!link) return; let feedUrl = (row.rss || "").trim(); if (!feedUrl) { try { const r = await getPodcastRss(link); feedUrl = r.feedUrl; } catch (e) { alert(e instanceof Error ? e.message : "Could not get RSS feed"); return; } } const cached = podcastPreviewCacheRef.current; const cacheValid = cached?.feedUrl === feedUrl && (Date.now() - (cached.cachedAt ?? 0)) < PODCAST_PREVIEW_CACHE_TTL_MS; if (cacheValid && cached) { setPodcastPreviewLinks(cached.links); setPodcastPreviewNewUrls(getStoredNewUrlsForFeed(feedUrl, cached.links.map((l) => l.url))); setPodcastPreviewOpen(true); setPodcastPreviewFeedUrl((row.rss || "").trim() ? feedUrl : ""); setPodcastPreviewSelectedIndices([]); setPodcastPreviewLoading(false); return; } setPodcastPreviewOpen(true); setPodcastPreviewFeedUrl((row.rss || "").trim() ? feedUrl : ""); setPodcastPreviewLoading(true); setPodcastPreviewLinks([]); setPodcastPreviewSelectedIndices([]); setPodcastPreviewNewUrls(new Set()); try { const links = await getPodcastFeedAudioLinks(feedUrl); const oldLinks = (podcastPreviewCacheRef.current?.feedUrl === feedUrl && podcastPreviewCacheRef.current?.links) ? podcastPreviewCacheRef.current.links : []; const newlyDetected = links.filter((l) => !oldLinks.some((o) => o.url === l.url)).map((l) => l.url); persistNewUrlsForFeed(feedUrl, newlyDetected); const currentUrls = links.map((l) => l.url); setPodcastPreviewLinks(links); setPodcastPreviewNewUrls(getStoredNewUrlsForFeed(feedUrl, currentUrls)); podcastPreviewCacheRef.current = { feedUrl, links, cachedAt: Date.now() }; } catch (e) { setPodcastPreviewLinks([]); podcastPreviewCacheRef.current = null; alert(e instanceof Error ? e.message : "Failed to fetch audio links"); } finally { setPodcastPreviewLoading(false); } }}>
                               <img src={previewIcon} alt="" className="step-podcast-preview-icon" />
                             </button>
                             <button type="button" className="step-podcast-delete" aria-label="Delete podcast" onClick={async () => { if (!row.id.startsWith("new-")) { try { await deletePodcast(row.id); } catch { /* ignore */ } } setPodcastRows(prev => prev.filter(r => r.id !== row.id)); }}><img src={deleteIcon} alt="" className="step-podcast-delete-icon" /></button>
@@ -2554,9 +2895,14 @@ export default function App() {
       )}
 
       {podcastPreviewOpen && (
-        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="podcast-preview-dialog-title" onClick={() => setPodcastPreviewOpen(false)}>
-          <div className="confirm-dialog confirm-dialog-preview" onClick={(e) => e.stopPropagation()}>
-            <p id="podcast-preview-dialog-title" className="confirm-text">Podcast audio/video links</p>
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="podcast-preview-dialog-title" onClick={() => { setPodcastPreviewOpen(false); if (!isUploading) setUploadingEpisodeUrl(null); }}>
+          <div className="confirm-dialog confirm-dialog-preview confirm-dialog-preview-episodes" onClick={(e) => e.stopPropagation()}>
+            <p id="podcast-preview-dialog-title" className="confirm-text">
+              Podcast audio/video links
+              {podcastPreviewFeedUrl ? (
+                <span className="confirm-text-rss">{podcastPreviewFeedUrl}</span>
+              ) : null}
+            </p>
             <div className="preview-dialog-body">
               {podcastPreviewLoading ? (
                 <p className="preview-loading">Loading…</p>
@@ -2570,7 +2916,9 @@ export default function App() {
                   <div
                     style={{
                       marginTop: 24,
-                      maxHeight: 280,
+                      flex: "1 1 0",
+                      minHeight: 240,
+                      maxHeight: 600,
                       overflowY: "auto",
                       overflowX: "hidden",
                       border: "1px solid var(--border)",
@@ -2578,10 +2926,11 @@ export default function App() {
                       padding: 0,
                     }}
                   >
-                    <ul style={{ listStyle: "none", margin: 0, padding: 0, minWidth: 0 }}>
+                    <ul className="episode-list" style={{ listStyle: "none", margin: 0, padding: 0, minWidth: 0 }}>
                       {podcastPreviewLinks.map((a, idx) => (
                         <li key={idx} className="history-item" style={{ borderBottom: "1px dotted var(--border)", paddingLeft: 12, paddingRight: 12, minWidth: 0 }}>
                           <label
+                            className="episode-row"
                             style={{
                               display: "flex",
                               alignItems: "center",
@@ -2612,14 +2961,58 @@ export default function App() {
                               <span className="history-item-name" title={a.title ?? a.url}>
                                 {a.title ?? "-"}
                               </span>
+                              {a.duration_seconds != null && (
+                                <span className="history-item-time" style={{ marginLeft: 8, flexShrink: 0 }} title="Duration">
+                                  {formatDuration(a.duration_seconds)}
+                                </span>
+                              )}
+                              {a.length_bytes != null && a.length_bytes > 0 && (
+                                <span className="history-item-time" style={{ marginLeft: 8, flexShrink: 0 }} title="File size">
+                                  {formatFileSize(a.length_bytes)}
+                                </span>
+                              )}
+                              {podcastPreviewNewUrls.has(a.url) && (
+                                <img src={newsIcon} alt="" className="podcast-preview-new-icon" width={16} height={16} style={{ marginLeft: 6, flexShrink: 0 }} title="New episode" />
+                              )}
                             </span>
-                            {/* download + split + transcribe: fixed width, no shrink */}
+                            {/* time: same level, middle */}
                             <span
                               style={{
                                 display: "flex",
                                 alignItems: "center",
-                                flex: "0 0 88px",
-                                gap: 8,
+                                flex: "0 1 140px",
+                                minWidth: 0,
+                                justifyContent: "flex-end",
+                              }}
+                            >
+                              <span className="history-item-time">{formatPubDate(a.pub_date)}</span>
+                              <span
+                                className={`episode-upload-progress${isUploading && uploadingEpisodeUrl === a.url && uploadProgress != null ? " episode-upload-progress--active" : ""}${!isUploading && isEpisodeUploadValid(a.url) ? " episode-upload-progress--uploaded" : ""}`}
+                                style={{
+                                  width: 72,
+                                  height: 24,
+                                  marginLeft: 8,
+                                  flexShrink: 0,
+                                  ...(isUploading && uploadingEpisodeUrl === a.url && uploadProgress != null
+                                    ? ({ "--episode-progress": uploadProgress } as React.CSSProperties)
+                                    : {}),
+                                }}
+                                title={isUploading && uploadingEpisodeUrl === a.url ? `Upload ${uploadProgress ?? 0}%` : isEpisodeUploadValid(a.url) ? "Uploaded" : undefined}
+                              >
+                                {isUploading && uploadingEpisodeUrl === a.url && uploadProgress != null
+                                  ? `${uploadProgress}%`
+                                  : isEpisodeUploadValid(a.url)
+                                    ? "uploaded"
+                                    : null}
+                              </span>
+                            </span>
+                            {/* download + upload + split + transcribe + translate + link: fixed width, no shrink */}
+                            <span
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                flex: "0 0 276px",
+                                gap: 12,
                                 marginRight: 8,
                               }}
                             >
@@ -2637,6 +3030,25 @@ export default function App() {
                                 }}
                               >
                                 <img src={downloadIcon} alt="" width={24} height={24} />
+                              </button>
+                              <button
+                                type="button"
+                                className="history-item-upload"
+                                title="upload"
+                                disabled={isUploading || isEpisodeUploadValid(a.url)}
+                                onClick={async (e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  const name = (a.title ?? "episode").trim() || "episode";
+                                  try {
+                                    await uploadFromUrlToTranscribe(a.url, name, a.length_bytes ?? undefined);
+                                  } catch (err) {
+                                    reportError("Failed to upload episode audio", err);
+                                    alert(err instanceof Error ? err.message : "Upload failed");
+                                  }
+                                }}
+                              >
+                                <img src={uploadIcon} alt="" width={24} height={24} />
                               </button>
                               <button
                                 type="button"
@@ -2662,31 +3074,53 @@ export default function App() {
                               >
                                 <img src={transcribeIcon} alt="" width={24} height={24} />
                               </button>
-                            </span>
-                            {/* URL: flex, truncate */}
-                            <span
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                flex: "1 1 0",
-                                minWidth: 0,
-                              }}
-                            >
-                              <a href={a.url} target="_blank" rel="noopener noreferrer" className="podcast-preview-link" title={a.url}>
-                                {a.url}
+                              <button
+                                type="button"
+                                className="history-item-translate"
+                                title="translate"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // TODO: wire to translate flow for this episode (a.url, a.title)
+                                }}
+                              >
+                                <img src={translateIcon} alt="" width={24} height={24} />
+                              </button>
+                              <button
+                                type="button"
+                                className="history-item-summarize"
+                                title="summarize"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // TODO: wire to summarize flow for this episode (a.url, a.title)
+                                }}
+                              >
+                                <img src={summarizeIcon} alt="" width={24} height={24} />
+                              </button>
+                              <button
+                                type="button"
+                                className="history-item-notion"
+                                title="Push to Notion"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  // TODO: wire to push-to-notion flow for this episode (a.url, a.title)
+                                }}
+                              >
+                                <img src={notionIcon} alt="" width={24} height={24} />
+                              </button>
+                              <a
+                                href={a.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="history-item-download"
+                                title={a.url}
+                                onClick={(e) => e.stopPropagation()}
+                                style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+                              >
+                                <img src={linkIcon} alt="" width={24} height={24} />
                               </a>
-                            </span>
-                            {/* time: can shrink with ellipsis */}
-                            <span
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "flex-end",
-                                flex: "0 1 140px",
-                                minWidth: 0,
-                              }}
-                            >
-                              <span className="history-item-time">{formatPubDate(a.pub_date)}</span>
                             </span>
                           </label>
                         </li>
@@ -2722,7 +3156,7 @@ export default function App() {
                   </button>
                 </>
               )}
-              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => setPodcastPreviewOpen(false)}>
+              <button type="button" className="confirm-btn confirm-btn-no" onClick={() => { setPodcastPreviewOpen(false); if (!isUploading) setUploadingEpisodeUrl(null); }}>
                 Close
               </button>
             </div>
@@ -2875,7 +3309,7 @@ export default function App() {
                     <div
                       style={{
                         marginTop: 12,
-                        maxHeight: 280,
+                        maxHeight: 600,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
                         borderRadius: 6,
@@ -2951,7 +3385,7 @@ export default function App() {
                     <div
                       style={{
                         marginTop: 12,
-                        maxHeight: 280,
+                        maxHeight: 600,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
                         borderRadius: 6,
@@ -3027,7 +3461,7 @@ export default function App() {
                     <div
                       style={{
                         marginTop: 12,
-                        maxHeight: 280,
+                        maxHeight: 600,
                         overflowY: "auto",
                         border: "1px solid var(--border)",
                         borderRadius: 6,
